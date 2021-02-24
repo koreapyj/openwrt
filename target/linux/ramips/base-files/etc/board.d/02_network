@@ -396,7 +396,9 @@ ramips_setup_interfaces()
 	dlink,dir-510l|\
 	glinet,vixmini|\
 	netgear,ex6150|\
-	re350-v1)
+	re350-v1|\
+	ringa8|\
+	exta8)
 		ucidef_add_switch "switch0" \
 			"0:lan" "6@eth0"
 		;;
@@ -455,6 +457,7 @@ ramips_setup_interfaces()
 		ucidef_add_switch "switch0" \
 			"0:lan" "1:lan" "2:wan" "6@eth0"
 		;;
+	a3002me|\
 	wiznet,wizfi630s)
 		ucidef_add_switch "switch0" \
 			"0:wan" "3:lan" "4:lan" "6@eth0"

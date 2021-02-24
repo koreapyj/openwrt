@@ -682,3 +682,30 @@ define Device/zbt-wg3526-32M
 	kmod-usb3 kmod-usb-ledtrig-usbport wpad-basic
 endef
 TARGET_DEVICES += zbt-wg3526-32M
+
+define Device/ringa8
+  DTS := RingA8
+  IMAGE_SIZE := $(ralink_default_fw_size_16M)
+  UIMAGE_NAME := ringa8
+  DEVICE_TITLE := ipTIME Ring-A8
+  DEVICE_PACKAGES := kmod-mt7615e wpad-wolfssl
+endef
+TARGET_DEVICES += ringa8
+
+define Device/exta8
+  DTS := ExtA8
+  IMAGE_SIZE := $(ralink_default_fw_size_16M)
+  UIMAGE_NAME := exta8
+  DEVICE_TITLE := ipTIME Extender-A8
+  DEVICE_PACKAGES := kmod-mt7615e wpad-wolfssl
+endef
+TARGET_DEVICES += exta8
+
+define Device/a3002me
+  DTS := A3002ME
+  IMAGE_SIZE := $(ralink_default_fw_size_16M)
+  UIMAGE_NAME := a3002me
+  DEVICE_TITLE := ipTIME A3002MESH
+  DEVICE_PACKAGES := kmod-mt7615e wpad-wolfssl
+endef
+TARGET_DEVICES += a3002me

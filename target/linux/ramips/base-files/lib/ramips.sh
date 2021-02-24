@@ -703,6 +703,15 @@ ramips_board_detect() {
 	*"YK1")
 		name="youku-yk1"
 		;;
+	*"ipTIME Ring-A8")
+		name="ringa8"
+		;;
+	*"ipTIME Extender-A8")
+		name="exta8"
+		;;
+	*"ipTIME A3002MESH")
+		name="a3002me"
+		;;
 	esac
 
 	# use generic board detect if no name is set
