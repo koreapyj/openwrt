@@ -224,12 +224,9 @@ define Build/install-dtb
 	)
 endef
 
-# prepend iptime-specific firmware header to image
-# add_iptime_fw_header <model> <version> <input_file> <output_file>
-define Build/iptime-fw-header
-	-$(STAGING_DIR_HOST)/bin/add_iptime_fw_header \
-		$(IPTIME_MODEL) 00_000 \
-		$@ $@.new && mv $@.new $@ || rm -f $@
+define Build/iptime-crc32
+	$(STAGING_DIR_HOST)/bin/iptime-crc32 $(1) $@ $@.new
+	mv $@.new $@
 endef
 
 define Build/jffs2

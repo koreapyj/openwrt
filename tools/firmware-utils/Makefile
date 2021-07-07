@@ -40,6 +40,7 @@ define Host/Compile
 	$(call cc,fix-u-media-header cyg_crc32,-Wall)
 	$(call cc,hcsmakeimage bcmalgo)
 	$(call cc,imagetag imagetag_cmdline cyg_crc32)
+	$(call cc,iptime-crc32 cyg_crc32,-Wall)
 	$(call cc,jcgimage,-lz -Wall)
 	$(call cc,lxlfw)
 	$(call cc,lzma2eva,-lz)
@@ -99,7 +100,6 @@ define Host/Compile
 	$(call cc,zyimage,-Wall)
 	$(call cc,zytrx,-Wall)
 	$(call cc,zyxbcm)
-	$(call cc,add_iptime_fw_header cyg_crc32, -Wall)
 endef
 
 define Host/Install
