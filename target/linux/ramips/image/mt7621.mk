@@ -770,16 +770,17 @@ define Device/iptime_ax2004m
   PAGESIZE := 2048
   KERNEL_SIZE := 4096k
   IMAGE_SIZE := 16128k
+  UBINIZE_OPTS := -E 5
+  KERNEL_LOADADDR := 0x82000000
+  KERNEL := kernel-bin | relocate-kernel 0x80001000 | lzma | loader-kernel | \
+	fit none $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+  IMAGES += factory.bin
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  IMAGE/factory.bin := append-kernel | pad-to $$$$(KERNEL_SIZE) | append-ubi | \
+	check-size | iptime-crc32 ax2004m
   DEVICE_VENDOR := ipTIME
   DEVICE_MODEL := AX2004M
-  DEVICE_PACKAGES := kmod-usb3 kmod-mt7915e
-  UBINIZE_OPTS := -E 5
-  IMAGES += sysupgrade.bin factory.img
-  IMAGE/factory.img := append-kernel | pad-to $$$$(KERNEL_SIZE) | append-ubi | check-size | iptime-fw-header
-  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
-  KERNEL := kernel-bin | relocate-kernel 0x80001000 | lzma | loader-kernel | fit none $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
-  IPTIME_MODEL := ax2004m
-  KERNEL_LOADADDR := 0x82000000
+  DEVICE_PACKAGES := kmod-mt7915e kmod-usb3
 endef
 TARGET_DEVICES += iptime_ax2004m
 
