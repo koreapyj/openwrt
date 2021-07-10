@@ -32,6 +32,16 @@ define Device/elecom_wrc-2533gent
 endef
 TARGET_DEVICES += elecom_wrc-2533gent
 
+define Device/iptime-ax8004m
+  DEVICE_VENDOR := ipTIME
+  DEVICE_MODEL := AX8004M
+  DEVICE_DTS := mt7622-iptime-ax8004m
+  DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
+  SUPPORTED_DEVICES := iptime,ax8004m
+  DEVICE_PACKAGES := kmod-usb-ohci kmod-usb2 kmod-usb3 kmod-mt7915e swconfig
+endef
+TARGET_DEVICES += iptime-ax8004m
+
 define Device/mediatek_mt7622-rfb1
   DEVICE_VENDOR := MediaTek
   DEVICE_MODEL := MTK7622 rfb1 AP
