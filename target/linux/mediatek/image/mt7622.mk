@@ -39,7 +39,7 @@ define Device/iptime-ax8004m
   DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
   SUPPORTED_DEVICES := iptime,ax8004m
   DEVICE_PACKAGES := kmod-usb-ohci kmod-usb2 kmod-usb3 kmod-mt7615e \
-  kmod-mt7915e swconfig
+  kmod-mt7915e
 endef
 TARGET_DEVICES += iptime-ax8004m
 
