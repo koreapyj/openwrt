@@ -18,6 +18,10 @@
 
 	aliases {
 		serial0 = &uart0;
+		led-boot = &led_cpu;
+		led-failsafe = &led_cpu;
+		led-running = &led_cpu;
+		led-upgrade = &led_cpu;
 	};
 
 	chosen {
@@ -50,6 +54,27 @@
 			label = "wps";
 			linux,code = <KEY_WPS_BUTTON>;
 			gpios = <&pio 102 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_cpu: cpu {
+			label = "orange:cpu";
+			gpios = <&pio 18 GPIO_ACTIVE_LOW>;
+		};
+
+		wlan2g {
+			label = "orange:wlan2g";
+			gpios = <&pio 16 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "phy0radio";
+		};
+
+		wlan5g {
+			label = "orange:wlan5g";
+			gpios = <&pio 17 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "phy1radio";
 		};
 	};
 
@@ -104,8 +129,8 @@
 		compatible = "mediatek,eth-mac";
 		reg = <0>;
 		phy-mode = "2500base-x";
-		mtd-mac-address = <&factory 0x4>;
-		mtd-mac-address-increment = <1>;
+		mtd-mac-address = <&factory 0x0004>;
+		mtd-mac-address-increment = <3>;
 
 		fixed-link {
 			speed = <2500>;
@@ -150,7 +175,8 @@
 				port@4 {
 					reg = <4>;
 					label = "wan";
-					mtd-mac-address = <&factory 0x4>;
+					mtd-mac-address = <&factory 0x0004>;
+					mtd-mac-address-increment = <1>;
 				};
 
 				port@6 {
@@ -207,11 +233,6 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&spi_nor_pins>;
 	status = "disabled";
-
-	flash@0 {
-		compatible = "jedec,spi-nor";
-		reg = <0>;
-	};
 };
 
 &pcie0 {
@@ -224,6 +245,7 @@
 	wifi@0,0 {
 		reg = <0x0 0 0 0 0>;
 	    mediatek,mtd-eeprom = <&factory 0x5000>;
+		ieee80211-freq-limit = <5000000 6000000>;
 	};
 };
 
@@ -535,43 +557,48 @@
 
 			partition@0 {
 				label = "Preloader";
-				reg = <0x00000 0x0080000>;
+				reg = <0x0000000 0x0080000>;
 				read-only;
 			};
 
 			partition@80000 {
 				label = "ATF";
-				reg = <0x80000 0x0040000>;
+				reg = <0x0080000 0x0040000>;
 				read-only;
 			};
 
 			partition@c0000 {
 				label = "Bootloader";
-				reg = <0xc0000 0x0080000>;
+				reg = <0x00c0000 0x0080000>;
 				read-only;
 			};
 
 			partition@140000 {
 				label = "Config";
-				reg = <0x140000 0x0080000>;
+				reg = <0x0140000 0x0080000>;
 				read-only;
 			};
 
 			factory: partition@1c0000 {
 				label = "Factory";
-				reg = <0x1c0000 0x0040000>;
+				reg = <0x01c0000 0x0040000>;
 				read-only;
 			};
 
 			partition@200000 {
-				label = "backup";
-				reg = <0x200000 0x2000000>;
+				label = "firmware1";
+				reg = <0x0200000 0x2000000>;
 				read-only;
 			};
 
 			partition@2200000 {
-				label = "firmware";
-				reg = <0x2200000 0x5000000>;
+				label = "kernel";
+				reg = <0x2200000 0x0400000>;
+			};
+
+			partition@2600000 {
+				label = "ubi";
+				reg = <0x2600000 0x4C00000>;
 			};
 		};
 	};

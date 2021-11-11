@@ -38,6 +38,15 @@ define Device/iptime-ax8004m
   DEVICE_DTS := mt7622-iptime-ax8004m
   DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
   SUPPORTED_DEVICES := iptime,ax8004m
+  UBINIZE_OPTS := -E 5
+  KERNEL_LOADADDR := 0x41080000
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  KERNEL_SIZE := 4096k
+  IMAGE_SIZE := 32768k
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-kernel | pad-to $$$$(KERNEL_SIZE) | append-ubi | \
+	check-size | iptime-crc32 ax8004m
   DEVICE_PACKAGES := kmod-usb-ohci kmod-usb2 kmod-usb3 kmod-mt7615e \
   kmod-mt7915e
 endef
