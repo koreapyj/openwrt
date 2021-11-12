@@ -48,7 +48,7 @@ define Device/iptime-ax8004m
   IMAGE/factory.bin := append-kernel | pad-to $$$$(KERNEL_SIZE) | append-ubi | \
 	check-size | iptime-crc32 ax8004m
   DEVICE_PACKAGES := kmod-usb-ohci kmod-usb2 kmod-usb3 kmod-mt7615e \
-  kmod-mt7915e
+  kmod-mt7915e uboot-envtools
 endef
 TARGET_DEVICES += iptime-ax8004m
 
