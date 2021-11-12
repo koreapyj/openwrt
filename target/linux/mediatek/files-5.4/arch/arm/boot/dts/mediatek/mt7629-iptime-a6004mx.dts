@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (c) 2019 MediaTek Inc.
+ * Author: Ryder Lee <ryder.lee@mediatek.com>
+ */
 
 /dts-v1/;
 #include <dt-bindings/input/input.h>
@@ -6,15 +10,15 @@
 
 / {
 	model = "ipTIME A6004MX";
-	compatible = "iptime,a6004mx", "mediatek,mt7629,ubi";
+	compatible = "iptime,a6004mx", "mediatek,mt7629";
 
 	aliases {
 		serial0 = &uart0;
 	};
 
 	chosen {
-		stdout-path = "serial0:115200";
-		bootargs = "earlycon=uart8250,mmio32,0x11002000 console=ttyS0,115200";
+		stdout-path = "serial0:115200n8";
+		bootargs = "earlycon=uart8250,mmio32,0x11002000 console=ttyS0,115200n8";
 	};
 
 	gpio-keys {
@@ -33,41 +37,31 @@
 		};
 	};
 
-	gsw: gsw@0 {
-		compatible = "mediatek,mt753x";
-		mediatek,ethsys = <&ethsys>;
-		#address-cells = <1>;
-		#size-cells = <0>;
-	};
-
 	memory@40000000 {
 		device_type = "memory";
 		reg = <0x40000000 0x10000000>;
 	};
 
-	// reg_3p3v: regulator-3p3v {
-	// 	compatible = "regulator-fixed";
-	// 	regulator-name = "fixed-3.3V";
-	// 	regulator-min-microvolt = <3300000>;
-	// 	regulator-max-microvolt = <3300000>;
-	// 	regulator-boot-on;
-	// 	regulator-always-on;
-	// };
+	reg_3p3v: regulator-3p3v {
+		compatible = "regulator-fixed";
+		regulator-name = "fixed-3.3V";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-boot-on;
+		regulator-always-on;
+	};
 
-	// reg_5v: regulator-5v {
-	// 	compatible = "regulator-fixed";
-	// 	regulator-name = "fixed-5V";
-	// 	regulator-min-microvolt = <5000000>;
-	// 	regulator-max-microvolt = <5000000>;
-	// 	regulator-boot-on;
-	// 	regulator-always-on;
-	// };
+	reg_5v: regulator-5v {
+		compatible = "regulator-fixed";
+		regulator-name = "fixed-5V";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		regulator-boot-on;
+		regulator-always-on;
+	};
 };
 
 &eth {
-	pinctrl-names = "default";
-	pinctrl-0 = <&eth_pins>;
-	pinctrl-1 = <&ephy_leds_pins>;
 	status = "okay";
 
 	gmac0: mac@0 {
@@ -97,26 +91,7 @@
 		phy0: ethernet-phy@0 {
 			reg = <0>;
 		};
-	};
-};
 
-&gsw {
-	mediatek,mdio = <&mdio>;
-	mediatek,portmap = "llllw";
-	mediatek,mdio_master_pinmux = <0>;
-	reset-gpios = <&pio 28 0>;
-	interrupt-parent = <&pio>;
-	interrupts = <6 IRQ_TYPE_LEVEL_HIGH>;
-	status = "okay";
-
-	port6: port@6 {
-		compatible = "mediatek,mt753x-port";
-		reg = <6>;
-		phy-mode = "sgmii";
-		fixed-link {
-			speed = <2500>;
-			full-duplex;
-		};
 	};
 };
 
@@ -124,10 +99,6 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&i2c_pins>;
 	status = "okay";
-};
-
-&qspi {
-	status = "disabled";
 };
 
 &pcie1 {
@@ -181,14 +152,6 @@
 		mux {
 			function = "pwm";
 			groups = "pwm_0";
-		};
-	};
-
-	/* SPI-NOR is shared pin with serial NAND */
-	qspi_pins: qspi-pins {
-		mux {
-			function = "flash";
-			groups = "spi_nor";
 		};
 	};
 
@@ -258,43 +221,32 @@
 			#size-cells = <1>;
 
 			partition@0 {
-				label = "u-boot";
-				reg = <0x0 0x100000>;
+				label = "Bootloader";
+				reg = <0x000000 0x100000>;
 				read-only;
 			};
 
 			partition@100000 {
-				label = "config";
-				reg = <0x100000 0x40000>;
+				label = "Config";
+				reg = <0x100000 0x040000>;
 				read-only;
 			};
 
 			factory: partition@140000 {
-				label = "factory";
-				reg = <0x140000 0x80000>;
+				label = "Factory";
+				reg = <0x140000 0x080000>;
 				read-only;
 			};
 
 			partition@1c0000 {
 				label = "kernel";
-				reg = <0x1c0000 0x1e0000>;
+				reg = <0x1c0000 0x400000>;
+				read-only;
 			};
 
-			partition@3a0000 {
+			partition@5c0000 {
 				label = "ubi";
-				reg = <0x3a0000 0x1e20000>;
-			};
-
-			partition@21c0000 {
-				label = "kernel2";
-				reg = <0x21c0000 0x2000000>;
-				read-only;
-			};
-
-			partition@41c0000 {
-				label = "User_data";
-				reg = <0x41c0000 0x3400000>;
-				read-only;
+				reg = <0x5c0000 0x7000000>;
 			};
 		};
 	};
@@ -307,13 +259,13 @@
 };
 
 &ssusb {
-// 	vusb33-supply = <&reg_3p3v>;
-// 	vbus-supply = <&reg_5v>;
-	status = "disabled";
+	vusb33-supply = <&reg_3p3v>;
+	vbus-supply = <&reg_5v>;
+	status = "okay";
 };
 
 &u3phy0 {
-	status = "disabled";
+	status = "okay";
 };
 
 &uart0 {

@@ -9,7 +9,10 @@ mediatek_setup_interfaces()
 	local board="$1"
 
 	case $board in
-	iptime,a6004mx|\
+	iptime,a6004mx)
+		ucidef_set_interface_wan "eth1"
+		ucidef_set_interface_lan "eth0"
+		;;
 	mediatek,mt7629-rfb)
 		ucidef_set_interface_wan "eth1"
 		ucidef_add_switch "switch0" \
