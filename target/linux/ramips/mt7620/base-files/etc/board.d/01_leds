@@ -101,6 +101,11 @@ engenius,esr600)
 	ucidef_set_led_netdev "wlan5g" "5.0GHz" "blue:wlan5g" "wlan0"
 	ucidef_set_led_netdev "wlan2g" "2.4GHz" "blue:wlan2g" "wlan1"
 	;;
+generic,lw-ip301)
+	ucidef_set_led_switch "lan1" "lan1" "green:lan1" "switch0" "0x01"
+	ucidef_set_led_switch "lan2" "lan2" "green:lan2" "switch0" "0x02"
+	ucidef_set_led_switch "wan" "wan" "green:wan" "switch0" "0x10"
+	;;
 glinet,gl-mt300a|\
 glinet,gl-mt300n|\
 glinet,gl-mt750)

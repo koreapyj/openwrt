@@ -170,6 +170,7 @@ ramips_setup_interfaces()
 		ucidef_add_switch "switch0" \
 			"1:lan" "2:lan" "3:lan" "4:lan" "5:wan" "0@eth0"
 		;;
+	generic,lw-ip301|\
 	lenovo,newifi-y1|\
 	xiaomi,miwifi-mini)
 		ucidef_add_switch "switch0" \
@@ -245,6 +246,7 @@ ramips_setup_macs()
 	bdcom,wap2100-sk|\
 	edimax,ew-7478apc|\
 	fon,fon2601|\
+	generic,lw-ip301|\
 	head-weblink,hdrm200|\
 	netgear,jwnr2010-v5|\
 	nexx,wt3020-4m|\

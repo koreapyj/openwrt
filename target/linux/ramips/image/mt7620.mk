@@ -410,6 +410,15 @@ define Device/fon_fon2601
 endef
 TARGET_DEVICES += fon_fon2601
 
+define Device/generic_lw-ip301
+  $(Device/uimage-lzma-loader)
+  SOC := mt7620n
+  IMAGE_SIZE := 7872k
+  DEVICE_VENDOR := Generic
+  DEVICE_MODEL := LW-IP301
+endef
+TARGET_DEVICES += generic_lw-ip301
+
 define Device/glinet_gl-mt300a
   SOC := mt7620a
   IMAGE_SIZE := 15872k
