@@ -761,11 +761,16 @@ TARGET_DEVICES += iptime_ax2004m
 
 define Device/iptime_a3002me
   $(Device/dsa-migration)
-  IMAGE_SIZE := 16128k
+  KERNEL_SIZE := 3392k
+  IMAGE_SIZE := 16064k
+  KERNEL_LOADADDR := 0x80001000
+  LOADER_TYPE := bin
+  KERNEL := kernel-bin | append-dtb | lzma | loader-kernel | relocate-kernel | \
+	lzma -a0 | uImage lzma
   UIMAGE_NAME := a3002me
   DEVICE_VENDOR := ipTIME
   DEVICE_MODEL := A3002MESH
-  DEVICE_PACKAGES := kmod-mt7615e kmod-mt7615-firmware kmod-usb3
+  DEVICE_PACKAGES := kmod-mt7615e kmod-mt7615-firmware
 endef
 TARGET_DEVICES += iptime_a3002me
 
