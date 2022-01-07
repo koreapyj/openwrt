@@ -31,7 +31,8 @@ ramips_setup_interfaces()
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
 		;;
 	asiarf,ap7621-001|\
-	winstars,ws-wn583a6)
+	winstars,ws-wn583a6|\
+	yuncore,ax820)
 		ucidef_set_interfaces_lan_wan "lan" "wan"
 		;;
 	asiarf,ap7621-nv1|\

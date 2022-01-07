@@ -769,6 +769,18 @@ define Device/iptime_a3002me
 endef
 TARGET_DEVICES += iptime_a3002me
 
+define Device/yuncore_ax820
+  $(Device/dsa-migration)
+  IMAGE_SIZE := 15424k
+	BLOCKSIZE := 64k
+  KERNEL_LOADADDR := 0x80001000
+	KERNEL = kernel-bin | relocate-kernel | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb | pad-to $$(BLOCKSIZE)
+  DEVICE_VENDOR := YunCore
+  DEVICE_MODEL := AX820-AP
+  DEVICE_PACKAGES := kmod-mt7915e
+endef
+TARGET_DEVICES += yuncore_ax820
+
 define Device/jcg_jhr-ac876m
   $(Device/dsa-migration)
   IMAGE_SIZE := 16064k
