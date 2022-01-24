@@ -82,12 +82,19 @@ _proto_mbim_setup() {
 	tid=$((tid + 1))
 
 	echo "mbim[$$]" "Checking pin"
-	umbim $DBG -n -t $tid -d $device pinstate || {
-		echo "mbim[$$]" "PIN required"
-		proto_notify_error "$interface" PIN_FAILED
-		proto_block_restart "$interface"
-		return 1
-	}
+	pin_status=`umbim $DBG -n -t $tid -d $device pinstate 2>&1 | head -n1 | sed 's/required pin:\s*\([[:digit:]]*\).*/\1/g'`
+	case "$pin_status" in
+		"Pin Unlocked"|\
+		"3")
+			;;
+		*)
+			echo "mbim[$$]" "PIN required"
+			echo "$pin_status"
+			proto_notify_error "$interface" PIN_FAILED
+			proto_block_restart "$interface"
+			return 1
+			;;
+	esac
 	tid=$((tid + 1))
 
 	echo "mbim[$$]" "Checking subscriber"
