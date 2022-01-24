@@ -86,6 +86,7 @@ _proto_mbim_setup() {
 	echo "mbim[$$]" "Checking pin"
 	pin_status=`umbim $DBG -n -t $tid -d $device pinstate 2>&1 | head -n1 | sed 's/required pin:\s*\([[:digit:]]*\).*/\1/g'`
 	case "$pin_status" in
+		""|\
 		"Pin Unlocked"|\
 		"3")
 			;;
@@ -125,7 +126,7 @@ _proto_mbim_setup() {
  
 	echo "mbim[$$]" "Connect to network"
 	while : ; do
-		connect_result=$(umbim $DBG -n -t $tid -d $device connect "$apn" "$pdptype" "$auth" "$username" "$password")
+		connect_result=$(umbim $DBG -n -t $tid -d $device connect "$apn" "$auth" "$username" "$password")
 		printf "$connect_result\n"
 		activation_state=$(echo $connect_result | sed 's/.*activationstate:\s*\([[:digit:]]*\).*/\1/g')
 		[ $activation_state != "0001" ] || break
@@ -149,20 +150,18 @@ _proto_mbim_setup() {
 	done
 	tid=$((tid + 1))
 
-	local iptype=$(echo $connect_result | sed 's/.*iptype:\s*\([[:digit:]]*\).*/\1/g')
 	local pdh_4=0
 	local pdh_6=0
-	case "$iptype" in
-		"0000"|\
-		"0003"|\
-		"0004")
+	case "$pdptype" in
+		"ipv4")
 			pdh_4=1
+			;;
+		"ipv6")
 			pdh_6=1
 			;;
-		"0001")
+		"ipv4v6")
+		*)
 			pdh_4=1
-			;;
-		"0002")
 			pdh_6=1
 			;;
 	esac
