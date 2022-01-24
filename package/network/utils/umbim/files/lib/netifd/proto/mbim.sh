@@ -17,6 +17,7 @@ proto_mbim_init_config() {
 	proto_config_add_string auth
 	proto_config_add_string username
 	proto_config_add_string password
+	proto_config_add_string pdptype
 	proto_config_add_defaults
 }
 
@@ -25,8 +26,9 @@ _proto_mbim_setup() {
 	local tid=2
 	local ret
 
-	local device apn pincode delay $PROTO_DEFAULT_OPTIONS
-	json_get_vars device apn pincode delay auth username password $PROTO_DEFAULT_OPTIONS
+	local device apn pincode delay auth username password pdptype  $PROTO_DEFAULT_OPTIONS
+	local ip4table ip6table
+	json_get_vars device apn pincode delay auth username password pdptype ip4table ip6table $PROTO_DEFAULT_OPTIONS
 
 	[ -n "$ctl_device" ] && device=$ctl_device
 
@@ -122,39 +124,81 @@ _proto_mbim_setup() {
 	tid=$((tid + 1))
  
 	echo "mbim[$$]" "Connect to network"
-	while ! umbim $DBG -n -t $tid -d $device connect "$apn" "$auth" "$username" "$password"; do
+	while : ; do
+		connect_result=$(umbim $DBG -n -t $tid -d $device connect "$apn" "$pdptype" "$auth" "$username" "$password")
+		printf "$connect_result\n"
+		activation_state=$(echo $connect_result | sed 's/.*activationstate:\s*\([[:digit:]]*\).*/\1/g')
+		[ $activation_state != "0001" ] || break
+		case "$activation_state" in
+			"0001")
+				break
+				;;
+			"0000"|\
+			"0002"|\
+			"0004")
+				;;
+			*)
+				echo "Unable to connect, check APN and authentication"
+				proto_notify_error "$interface" NO_PDH
+				proto_block_restart "$interface"
+				return 1
+				;;
+		esac
 		tid=$((tid + 1))
 		sleep 1;
 	done
 	tid=$((tid + 1))
 
+	local iptype=$(echo $connect_result | sed 's/.*iptype:\s*\([[:digit:]]*\).*/\1/g')
+	local pdh_4=0
+	local pdh_6=0
+	case "$iptype" in
+		"0000"|\
+		"0003"|\
+		"0004")
+			pdh_4=1
+			pdh_6=1
+			;;
+		"0001")
+			pdh_4=1
+			;;
+		"0002")
+			pdh_6=1
+			;;
+	esac
+
 	uci_set_state network $interface tid "$tid"
 
-	echo "mbim[$$]" "Connected, starting DHCP"
+	echo "mbim[$$]" "Connected($iptype), starting DHCP"
 	proto_init_update "$ifname" 1
 	proto_send_update "$interface"
 
 	local zone="$(fw3 -q network "$interface" 2>/dev/null)"
 
-	json_init
-	json_add_string name "${interface}_4"
-	json_add_string ifname "@$interface"
-	json_add_string proto "dhcp"
-	[ -n "$ip4table" ] && json_add_string ip4table "$ip4table"
-	proto_add_dynamic_defaults
-	[ -n "$zone" ] && json_add_string zone "$zone"
-	json_close_object
-	ubus call network add_dynamic "$(json_dump)"
+	if [ "$pdh_4" -ne "0" ]; then
+		json_init
+		json_add_string name "${interface}_4"
+		json_add_string ifname "@$interface"
+		json_add_string proto "dhcp"
+		[ -n "$ip4table" ] && json_add_string ip4table "$ip4table"
+		proto_add_dynamic_defaults
+		[ -n "$zone" ] && json_add_string zone "$zone"
+		json_close_object
+		ubus call network add_dynamic "$(json_dump)"
+	fi
 
-	json_init
-	json_add_string name "${interface}_6"
-	json_add_string ifname "@$interface"
-	json_add_string proto "dhcpv6"
-	[ -n "$ip6table" ] && json_add_string ip6table "$ip6table"
-	json_add_string extendprefix 1
-	proto_add_dynamic_defaults
-	[ -n "$zone" ] && json_add_string zone "$zone"
-	ubus call network add_dynamic "$(json_dump)"
+	if [ "$pdh_6" -ne "0" ]; then
+		json_init
+		json_add_string name "${interface}_6"
+		json_add_string ifname "@$interface"
+		json_add_string proto "dhcpv6"
+		[ -n "$ip6table" ] && json_add_string ip6table "$ip6table"
+		proto_add_dynamic_defaults
+		json_add_string extendprefix 1
+		[ -n "$zone" ] && json_add_string zone "$zone"
+		json_close_object
+		ubus call network add_dynamic "$(json_dump)"
+	fi
 }
 
 proto_mbim_setup() {
