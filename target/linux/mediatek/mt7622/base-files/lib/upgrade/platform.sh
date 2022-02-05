@@ -2,6 +2,21 @@ platform_do_upgrade() {
 	local board=$(board_name)
 
 	case "$board" in
+	bananapi,bpi-r64)
+		export_bootdevice
+		export_partdevice rootdev 0
+		case "$rootdev" in
+		mmc*)
+			CI_ROOTDEV="$rootdev"
+			CI_KERNPART="production"
+			emmc_do_upgrade "$1"
+			;;
+		*)
+			CI_KERNPART="fit"
+			nand_do_upgrade "$1"
+			;;
+		esac
+		;;
 	bananapi,bpi-r64-rootdisk)
 		#2097152=0x200000 is the offset in bytes from the start
 		#of eMMC and to the location of the kernel

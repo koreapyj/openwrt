@@ -32,7 +32,7 @@
  
  &btif {
 @@ -551,6 +551,62 @@
- 	status = "disable";
+ 	status = "disabled";
  };
  
 +&snfi {

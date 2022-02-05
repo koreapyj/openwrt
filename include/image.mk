@@ -476,6 +476,7 @@ define Device/Build/initramfs
 	  $$(if $$(CONFIG_JSON_OVERVIEW_IMAGE_INFO), $(BUILD_DIR)/json_info_files/$$(KERNEL_INITRAMFS_IMAGE).json,))
 
   $(KDIR)/$$(KERNEL_INITRAMFS_NAME):: image_prepare
+  $(1)-images: $(BIN_DIR)/$$(KERNEL_INITRAMFS_IMAGE)
   $(BIN_DIR)/$$(KERNEL_INITRAMFS_IMAGE): $(KDIR)/tmp/$$(KERNEL_INITRAMFS_IMAGE)
 	cp $$^ $$@
 
@@ -568,6 +569,7 @@ define Device/Build/image
 	  $(BUILD_DIR)/json_info_files/$(call IMAGE_NAME,$(1),$(2)).json, \
 	  $(BIN_DIR)/$(call IMAGE_NAME,$(1),$(2))$$(GZ_SUFFIX))
   $(eval $(call Device/Export,$(KDIR)/tmp/$(call IMAGE_NAME,$(1),$(2)),$(1)))
+  $(3)-images: $(BIN_DIR)/$(call IMAGE_NAME,$(1),$(2))$$(GZ_SUFFIX)
 
   ROOTFS/$(1)/$(3) := \
 	$(KDIR)/root.$(1)$$(strip \
@@ -626,7 +628,7 @@ endef
 define Device/Build/artifact
   $$(_TARGET): $(BIN_DIR)/$(IMAGE_PREFIX)-$(1)
   $(eval $(call Device/Export,$(KDIR)/tmp/$(IMAGE_PREFIX)-$(1)))
-  $(KDIR)/tmp/$(IMAGE_PREFIX)-$(1): $$(KDIR_KERNEL_IMAGE)
+  $(KDIR)/tmp/$(IMAGE_PREFIX)-$(1): $$(KDIR_KERNEL_IMAGE) $(2)-images
 	@rm -f $$@
 	$$(call concat_cmd,$(ARTIFACT/$(1)))
 
@@ -649,7 +651,7 @@ define Device/Build
       $$(call Device/Build/image,$$(fs),$$(image),$(1)))))
 
   $$(eval $$(foreach artifact,$$(ARTIFACTS), \
-    $$(call Device/Build/artifact,$$(artifact))))
+    $$(call Device/Build/artifact,$$(artifact),$(1))))
 
 endef
 
