@@ -17,10 +17,6 @@
 		led-upgrade = &led_cpu;
 	};
 
-	chosen {
-		bootargs = "console=ttyS0,115200";
-	};
-
 	leds {
 		compatible = "gpio-leds";
 
@@ -197,7 +193,6 @@
 			partition@e0000 {
 				label = "u-boot-env";
 				reg = <0xe0000 0x10000>;
-				read-only;
 			};
 			partition@f0000 {
 				label = "u-boot-env2";
