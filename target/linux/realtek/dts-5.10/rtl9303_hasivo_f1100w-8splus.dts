@@ -301,12 +301,7 @@
 			sfp = <&sfp0>;
 			led-num = <3>;
 			led-set = <0>;
-
-			fixed-link {
-				speed = <10000>;
-				full-duplex;
-				pause;
-			};
+			managed = "in-band-status";
 		};
 
 		port@8 {
@@ -317,12 +312,7 @@
 			sfp = <&sfp1>;
 			led-num = <3>;
 			led-set = <0>;
-
-			fixed-link {
-				speed = <10000>;
-				full-duplex;
-				pause;
-			};
+			managed = "in-band-status";
 		};
 
 		port@16 {
@@ -333,12 +323,7 @@
 			sfp = <&sfp2>;
 			led-num = <3>;
 			led-set = <0>;
-
-			fixed-link {
-				speed = <10000>;
-				full-duplex;
-				pause;
-			};
+			managed = "in-band-status";
 		};
 
 		port@20 {
@@ -349,12 +334,7 @@
 			sfp = <&sfp3>;
 			led-num = <3>;
 			led-set = <0>;
-
-			fixed-link {
-				speed = <10000>;
-				full-duplex;
-				pause;
-			};
+			managed = "in-band-status";
 		};
 
 		port@24 {
@@ -365,12 +345,7 @@
 			sfp = <&sfp4>;
 			led-num = <3>;
 			led-set = <0>;
-
-			fixed-link {
-				speed = <10000>;
-				full-duplex;
-				pause;
-			};
+			managed = "in-band-status";
 		};
 
 		port@25 {
@@ -381,12 +356,7 @@
 			sfp = <&sfp5>;
 			led-num = <3>;
 			led-set = <0>;
-
-			fixed-link {
-				speed = <10000>;
-				full-duplex;
-				pause;
-			};
+			managed = "in-band-status";
 		};
 
 		port@26 {
@@ -397,12 +367,7 @@
 			sfp = <&sfp6>;
 			led-num = <3>;
 			led-set = <0>;
-
-			fixed-link {
-				speed = <10000>;
-				full-duplex;
-				pause;
-			};
+			managed = "in-band-status";
 		};
 
 		port@27 {
@@ -413,12 +378,7 @@
 			sfp = <&sfp7>;
 			led-num = <3>;
 			led-set = <0>;
-
-			fixed-link {
-				speed = <10000>;
-				full-duplex;
-				pause;
-			};
+			managed = "in-band-status";
 		};
 
 		port@28 {
