@@ -1,0 +1,345 @@
+From d6c926e2321668a1062c205555e3310fe55a89b2 Mon Sep 17 00:00:00 2001
+From: koreapyj <koreapyj@localhost>
+Date: Mon, 30 May 2022 08:55:58 +0000
+Subject: [PATCH] 2
+
+---
+ drivers/net/phy/phylink.c | 27 ++++++++++++---------
+ drivers/net/phy/sfp.c     | 49 ++++++++++++++++++++++++++++++---------
+ 2 files changed, 54 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+index 7ae6f43c3..1ed261a7c 100644
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -94,7 +94,7 @@ struct phylink {
+ #define phylink_info(pl, fmt, ...) \
+ 	phylink_printk(KERN_INFO, pl, fmt, ##__VA_ARGS__)
+ #if defined(CONFIG_DYNAMIC_DEBUG)
+-#define phylink_dbg(pl, fmt, ...) \
++#define phylink_info(pl, fmt, ...) \
+ do {									\
+ 	if ((pl)->config->type == PHYLINK_NETDEV)			\
+ 		netdev_dbg((pl)->netdev, fmt, ##__VA_ARGS__);		\
+@@ -102,10 +102,10 @@ do {									\
+ 		dev_dbg((pl)->dev, fmt, ##__VA_ARGS__);			\
+ } while (0)
+ #elif defined(DEBUG)
+-#define phylink_dbg(pl, fmt, ...)					\
++#define phylink_info(pl, fmt, ...)					\
+ 	phylink_printk(KERN_DEBUG, pl, fmt, ##__VA_ARGS__)
+ #else
+-#define phylink_dbg(pl, fmt, ...)					\
++#define phylink_info(pl, fmt, ...)					\
+ ({									\
+ 	if (0)								\
+ 		phylink_printk(KERN_DEBUG, pl, fmt, ##__VA_ARGS__);	\
+@@ -410,7 +410,7 @@ static void phylink_resolve_flow(struct phylink_link_state *state)
+ static void phylink_mac_config(struct phylink *pl,
+ 			       const struct phylink_link_state *state)
+ {
+-	phylink_dbg(pl,
++	phylink_info(pl,
+ 		    "%s: mode=%s/%s/%s/%s adv=%*pb pause=%02x link=%u an=%u\n",
+ 		    __func__, phylink_an_mode_str(pl->cur_link_an_mode),
+ 		    phy_modes(state->interface),
+@@ -439,7 +439,7 @@ static void phylink_major_config(struct phylink *pl, bool restart,
+ {
+ 	int err;
+ 
+-	phylink_dbg(pl, "major config %s\n", phy_modes(state->interface));
++	phylink_info(pl, "major config %s\n", phy_modes(state->interface));
+ 
+ 	if (pl->mac_ops->mac_prepare) {
+ 		err = pl->mac_ops->mac_prepare(pl->config, pl->cur_link_an_mode,
+@@ -497,7 +497,7 @@ static int phylink_change_inband_advert(struct phylink *pl)
+ 		return 0;
+ 	}
+ 
+-	phylink_dbg(pl, "%s: mode=%s/%s adv=%*pb pause=%02x\n", __func__,
++	phylink_info(pl, "%s: mode=%s/%s adv=%*pb pause=%02x\n", __func__,
+ 		    phylink_an_mode_str(pl->cur_link_an_mode),
+ 		    phy_modes(pl->link_config.interface),
+ 		    __ETHTOOL_LINK_MODE_MASK_NBITS, pl->link_config.advertising,
+@@ -952,7 +952,7 @@ static void phylink_phy_change(struct phy_device *phydev, bool up)
+ 
+ 	phylink_run_resolve(pl);
+ 
+-	phylink_dbg(pl, "phy link %s %s/%s/%s\n", up ? "up" : "down",
++	phylink_info(pl, "phy link %s %s/%s/%s\n", up ? "up" : "down",
+ 		    phy_modes(phydev->interface),
+ 		    phy_speed_to_str(phydev->speed),
+ 		    phy_duplex_to_str(phydev->duplex));
+@@ -1026,7 +1026,7 @@ static int phylink_bringup_phy(struct phylink *pl, struct phy_device *phy,
+ 	mutex_unlock(&pl->state_mutex);
+ 	mutex_unlock(&phy->lock);
+ 
+-	phylink_dbg(pl,
++	phylink_info(pl,
+ 		    "phy: setting supported %*pb advertising %*pb\n",
+ 		    __ETHTOOL_LINK_MODE_MASK_NBITS, pl->supported,
+ 		    __ETHTOOL_LINK_MODE_MASK_NBITS, phy->advertising);
+@@ -1184,7 +1184,7 @@ void phylink_mac_change(struct phylink *pl, bool up)
+ 	if (!up)
+ 		pl->mac_link_dropped = true;
+ 	phylink_run_resolve(pl);
+-	phylink_dbg(pl, "mac link %s\n", up ? "up" : "down");
++	phylink_info(pl, "mac link %s\n", up ? "up" : "down");
+ }
+ EXPORT_SYMBOL_GPL(phylink_mac_change);
+ 
+@@ -2089,6 +2089,7 @@ static int phylink_sfp_config(struct phylink *pl, u8 mode,
+ 	bool changed;
+ 	int ret;
+ 
++	phylink_info(pl, "In %s\n", __func__);
+ 	linkmode_copy(support, supported);
+ 
+ 	memset(&config, 0, sizeof(config));
+@@ -2126,12 +2127,14 @@ static int phylink_sfp_config(struct phylink *pl, u8 mode,
+ 		return ret;
+ 	}
+ 
+-	phylink_dbg(pl, "requesting link mode %s/%s with support %*pb\n",
++	phylink_info(pl, "requesting link mode %s/%s with support %*pb\n",
+ 		    phylink_an_mode_str(mode), phy_modes(config.interface),
+ 		    __ETHTOOL_LINK_MODE_MASK_NBITS, support);
+ 
+-	if (phy_interface_mode_is_8023z(iface) && pl->phydev)
++	if (phy_interface_mode_is_8023z(iface) && pl->phydev) {
++		phylink_info(pl, "  phy_interface_mode_is_8023z\n");
+ 		return -EINVAL;
++	}
+ 
+ 	changed = !linkmode_equal(pl->supported, support) ||
+ 		  !linkmode_equal(pl->link_config.advertising,
+@@ -2171,8 +2174,10 @@ static int phylink_sfp_module_insert(void *upstream,
+ 	ASSERT_RTNL();
+ 
+ 	linkmode_zero(support);
++	phylink_info(pl, "In %s\n", __func__);
+ 	sfp_parse_support(pl->sfp_bus, id, support);
+ 	pl->sfp_port = sfp_parse_port(pl->sfp_bus, id, support);
++	phylink_info(pl, "  support=%*pb\n", __ETHTOOL_LINK_MODE_MASK_NBITS, support);
+ 
+ 	/* If this module may have a PHY connecting later, defer until later */
+ 	pl->sfp_may_have_phy = sfp_may_have_phy(pl->sfp_bus, id);
+diff --git a/drivers/net/phy/sfp.c b/drivers/net/phy/sfp.c
+index f45e011a3..03a6c065a 100644
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -1436,7 +1436,7 @@ static void sfp_hwmon_exit(struct sfp *sfp)
+ /* Helpers */
+ static void sfp_module_tx_disable(struct sfp *sfp)
+ {
+-	dev_dbg(sfp->dev, "tx disable %u -> %u\n",
++	dev_info(sfp->dev, "tx disable %u -> %u\n",
+ 		sfp->state & SFP_F_TX_DISABLE ? 1 : 0, 1);
+ 	sfp->state |= SFP_F_TX_DISABLE;
+ 	sfp_set_state(sfp, sfp->state);
+@@ -1444,7 +1444,7 @@ static void sfp_module_tx_disable(struct sfp *sfp)
+ 
+ static void sfp_module_tx_enable(struct sfp *sfp)
+ {
+-	dev_dbg(sfp->dev, "tx disable %u -> %u\n",
++	dev_info(sfp->dev, "tx disable %u -> %u\n",
+ 		sfp->state & SFP_F_TX_DISABLE ? 1 : 0, 0);
+ 	sfp->state &= ~SFP_F_TX_DISABLE;
+ 	sfp_set_state(sfp, sfp->state);
+@@ -1802,6 +1802,7 @@ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
+ 
+ 	ret = sfp_read(sfp, false, 0, &id.base, sizeof(id.base));
+ 	if (ret < 0) {
++		dev_info(sfp->dev, "sfp_read error");
+ 		if (report)
+ 			dev_err(sfp->dev, "failed to read EEPROM: %d\n", ret);
+ 		return -EAGAIN;
+@@ -1827,6 +1828,7 @@ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
+ 
+ 		ret = sfp_read(sfp, false, 0, &id.base, sizeof(id.base));
+ 		if (ret < 0) {
++			dev_info(sfp->dev, "sfp_read(2) error");
+ 			if (report)
+ 				dev_err(sfp->dev, "failed to read EEPROM: %d\n",
+ 					ret);
+@@ -1852,6 +1854,7 @@ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
+ 	 */
+ 	if (cotsworks && cotsworks_sfbg) {
+ 		ret = sfp_cotsworks_fixup_check(sfp, &id);
++		dev_info(sfp->dev, "sfp_cotsworks_fixup_check error");
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+@@ -1875,6 +1878,7 @@ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
+ 
+ 	ret = sfp_read(sfp, false, SFP_CC_BASE + 1, &id.ext, sizeof(id.ext));
+ 	if (ret < 0) {
++		dev_info(sfp->dev, "sfp_read(3) error");
+ 		if (report)
+ 			dev_err(sfp->dev, "failed to read EEPROM: %d\n", ret);
+ 		return -EAGAIN;
+@@ -1925,8 +1929,10 @@ static int sfp_sm_mod_probe(struct sfp *sfp, bool report)
+ 
+ 	/* Parse the module power requirement */
+ 	ret = sfp_module_parse_power(sfp);
+-	if (ret < 0)
++	if (ret < 0) {
++		dev_info(sfp->dev, "sfp_module_parse_power error");
+ 		return ret;
++	}
+ 
+ 	if (!memcmp(id.base.vendor_name, "ALCATELLUCENT   ", 16) &&
+ 	    !memcmp(id.base.vendor_pn, "3FE46541AA      ", 16))
+@@ -2028,6 +2034,9 @@ static void sfp_sm_module(struct sfp *sfp, unsigned int event)
+ 			break;
+ 
+ 		err = sfp_sm_mod_probe(sfp, sfp->sm_mod_tries == 1);
++		if (err) {
++			dev_warn(sfp->dev, "sfp_sm_mod_probe error: %d\n", err);
++		}
+ 		if (err == -EAGAIN) {
+ 			if (sfp->sm_mod_tries_init &&
+ 			   --sfp->sm_mod_tries_init) {
+@@ -2042,6 +2051,7 @@ static void sfp_sm_module(struct sfp *sfp, unsigned int event)
+ 			}
+ 		}
+ 		if (err < 0) {
++			dev_warn(sfp->dev, "sfp_sm_mod_probe error(2): %d\n", err);
+ 			sfp_sm_mod_next(sfp, SFP_MOD_ERROR, 0);
+ 			break;
+ 		}
+@@ -2053,6 +2063,7 @@ static void sfp_sm_module(struct sfp *sfp, unsigned int event)
+ 		sfp_sm_mod_next(sfp, SFP_MOD_WAITDEV, 0);
+ 		fallthrough;
+ 	case SFP_MOD_WAITDEV:
++		dev_info(sfp->dev, "%s: on SFP_MOD_WAITDEV\n", __func__);
+ 		/* Ensure that the device is attached before proceeding */
+ 		if (sfp->sm_dev_state < SFP_DEV_DOWN)
+ 			break;
+@@ -2060,6 +2071,7 @@ static void sfp_sm_module(struct sfp *sfp, unsigned int event)
+ 		/* Report the module insertion to the upstream device */
+ 		err = sfp_module_insert(sfp->sfp_bus, &sfp->id);
+ 		if (err < 0) {
++			dev_warn(sfp->dev, "%s: error %d on sfp_module_insert\n", __func__, err);
+ 			sfp_sm_mod_next(sfp, SFP_MOD_ERROR, 0);
+ 			break;
+ 		}
+@@ -2071,6 +2083,7 @@ static void sfp_sm_module(struct sfp *sfp, unsigned int event)
+ 		sfp_sm_mod_next(sfp, SFP_MOD_HPOWER, 0);
+ 		fallthrough;
+ 	case SFP_MOD_HPOWER:
++		dev_info(sfp->dev, "%s: on SFP_MOD_HPOWER\n", __func__);
+ 		/* Enable high power mode */
+ 		err = sfp_sm_mod_hpower(sfp, true);
+ 		if (err < 0) {
+@@ -2150,6 +2163,7 @@ static void sfp_sm_main(struct sfp *sfp, unsigned int event)
+ 			break;
+ 
+ 		if (sfp->state & SFP_F_TX_FAULT) {
++			dev_warn(sfp->dev, "%s on SFP_S_WAIT / SFP_F_TX_FAULT presence\n", __func__);
+ 			/* Wait up to t_init (SFF-8472) or t_start_up (SFF-8431)
+ 			 * from the TX_DISABLE deassertion for the module to
+ 			 * initialise, which is indicated by TX_FAULT
+@@ -2262,7 +2276,7 @@ static void sfp_sm_event(struct sfp *sfp, unsigned int event)
+ {
+ 	mutex_lock(&sfp->sm_mutex);
+ 
+-	dev_dbg(sfp->dev, "SM: enter %s:%s:%s event %s\n",
++	dev_info(sfp->dev, "SM: enter %s:%s:%s event %s\n",
+ 		mod_state_to_str(sfp->sm_mod_state),
+ 		dev_state_to_str(sfp->sm_dev_state),
+ 		sm_state_to_str(sfp->sm_state),
+@@ -2272,7 +2286,7 @@ static void sfp_sm_event(struct sfp *sfp, unsigned int event)
+ 	sfp_sm_module(sfp, event);
+ 	sfp_sm_main(sfp, event);
+ 
+-	dev_dbg(sfp->dev, "SM: exit %s:%s:%s\n",
++	dev_info(sfp->dev, "SM: exit %s:%s:%s\n",
+ 		mod_state_to_str(sfp->sm_mod_state),
+ 		dev_state_to_str(sfp->sm_dev_state),
+ 		sm_state_to_str(sfp->sm_state));
+@@ -2381,7 +2395,7 @@ static void sfp_check_state(struct sfp *sfp)
+ 
+ 	for (i = 0; i < GPIO_MAX; i++)
+ 		if (changed & BIT(i))
+-			dev_dbg(sfp->dev, "%s %u -> %u\n", gpio_of_names[i],
++			dev_info(sfp->dev, "%s %u -> %u\n", gpio_of_names[i],
+ 				!!(sfp->state & BIT(i)), !!(state & BIT(i)));
+ 
+ 	state |= sfp->state & (SFP_F_TX_DISABLE | SFP_F_RATE_SELECT);
+@@ -2469,14 +2483,18 @@ static int sfp_probe(struct platform_device *pdev)
+ 	int err, i;
+ 
+ 	sfp = sfp_alloc(&pdev->dev);
+-	if (IS_ERR(sfp))
++	if (IS_ERR(sfp)) {
++		dev_err(sfp->dev, "sfp_alloc error\n");
+ 		return PTR_ERR(sfp);
++	}
+ 
+ 	platform_set_drvdata(pdev, sfp);
+ 
+ 	err = devm_add_action(sfp->dev, sfp_cleanup, sfp);
+-	if (err < 0)
++	if (err < 0) {
++		dev_err(sfp->dev, "devm_add_action error\n");
+ 		return err;
++	}
+ 
+ 	sff = sfp->type = &sfp_data;
+ 
+@@ -2486,8 +2504,10 @@ static int sfp_probe(struct platform_device *pdev)
+ 		struct device_node *np;
+ 
+ 		id = of_match_node(sfp_of_match, node);
+-		if (WARN_ON(!id))
++		if (WARN_ON(!id)) {
++			dev_err(sfp->dev, "of_match_node error\n");
+ 			return -EINVAL;
++		}
+ 
+ 		sff = sfp->type = id->data;
+ 
+@@ -2515,14 +2535,18 @@ static int sfp_probe(struct platform_device *pdev)
+ 		acpi_handle = ACPI_HANDLE_FWNODE(args.fwnode);
+ 		i2c = i2c_acpi_find_adapter_by_handle(acpi_handle);
+ 	} else {
++		dev_err(sfp->dev, "i2c initialize error\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	if (!i2c)
++	if (!i2c) {
++		dev_err(sfp->dev, "no i2c error\n");
+ 		return -EPROBE_DEFER;
++	}
+ 
+ 	err = sfp_i2c_configure(sfp, i2c);
+ 	if (err < 0) {
++		dev_err(sfp->dev, "sfp_i2c_configure error\n");
+ 		i2c_put_adapter(i2c);
+ 		return err;
+ 	}
+@@ -2531,8 +2555,10 @@ static int sfp_probe(struct platform_device *pdev)
+ 		if (sff->gpios & BIT(i)) {
+ 			sfp->gpio[i] = devm_gpiod_get_optional(sfp->dev,
+ 					   gpio_of_names[i], gpio_flags[i]);
+-			if (IS_ERR(sfp->gpio[i]))
++			if (IS_ERR(sfp->gpio[i])) {
++				dev_err(sfp->dev, "gpio%d error\n",i);
+ 				return PTR_ERR(sfp->gpio[i]);
++			}
+ 		}
+ 
+ 	sfp->get_state = sfp_gpio_get_state;
+@@ -2612,6 +2638,7 @@ static int sfp_probe(struct platform_device *pdev)
+ 	if (!sfp->sfp_bus)
+ 		return -ENOMEM;
+ 
++	dev_err(sfp->dev, "sfp_probe done.\n");
+ 	return 0;
+ }
+ 
+-- 
+2.25.1
+

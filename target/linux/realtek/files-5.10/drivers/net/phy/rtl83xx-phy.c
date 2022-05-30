@@ -10,6 +10,7 @@
 #include <linux/netdevice.h>
 #include <linux/firmware.h>
 #include <linux/crc32.h>
+#include <linux/sfp.h>
 
 #include <asm/mach-rtl838x/mach-rtl83xx.h>
 #include "rtl83xx-phy.h"
@@ -160,7 +161,7 @@ u8  rtl9300_sds_lsb[]  = { 0, 6, 12, 18, 0, 6, 12, 18, 0, 6, 0, 6};
 void rtl9300_sds_rst(int sds_num, u32 mode)
 {
 	pr_info("%s %d\n", __func__, mode);
-	if (sds_num < 0 || sds_num > 11) {
+	if ((signed)sds_num < 0 || sds_num > 11) {
 		pr_err("Wrong SerDes number: %d\n", sds_num);
 		return;
 	}
@@ -180,7 +181,7 @@ void rtl9300_sds_rst(int sds_num, u32 mode)
 void rtl9300_sds_set(int sds_num, u32 mode)
 {
 	pr_info("%s %d\n", __func__, mode);
-	if (sds_num < 0 || sds_num > 11) {
+	if ((signed)sds_num < 0 || sds_num > 11) {
 		pr_err("Wrong SerDes number: %d\n", sds_num);
 		return;
 	}
@@ -197,7 +198,7 @@ u32 rtl9300_sds_mode_get(int sds_num)
 {
 	u32 v;
 
-	if (sds_num < 0 || sds_num > 11) {
+	if ((signed)sds_num < 0 || sds_num > 11) {
 		pr_err("Wrong SerDes number: %d\n", sds_num);
 		return 0;
 	}
@@ -1616,17 +1617,17 @@ static int rtl9300_read_status(struct phy_device *phydev)
 
 		if (of_property_read_u32(dn, "sds", &sds_num))
 			sds_num = -1;
-		pr_debug("%s: Port %d, SerDes is %d\n", __func__, phy_addr, sds_num);
+		pr_info("%s: Port %d, SerDes is %d\n", __func__, phy_addr, sds_num);
 	} else {
 		dev_err(dev, "No DT node.\n");
 		return -EINVAL;
 	}
 
-	if (sds_num < 0)
+	if ((signed)sds_num < 0)
 		return 0;
 
 	mode = rtl9300_sds_mode_get(sds_num);
-	pr_debug("%s got SDS mode %02x\n", __func__, mode);
+	pr_info("%s got SDS mode %02x\n", __func__, mode);
 	if (mode == 0x1a) {		// 10GR mode
 		status = rtl9300_sds_field_r(sds_num, 0x5, 0, 12, 12);
 		latch_status = rtl9300_sds_field_r(sds_num, 0x4, 1, 2, 2);
@@ -1639,7 +1640,7 @@ static int rtl9300_read_status(struct phy_device *phydev)
 		latch_status |= rtl9300_sds_field_r(sds_num, 0x1, 30, 8, 0);
 	}
 
-	pr_debug("%s link status: status: %d, latch %d\n", __func__, status, latch_status);
+	pr_info("%s link status: status: %d, latch %d\n", __func__, status, latch_status);
 
 	if (latch_status) {
 		phydev->link = true;
@@ -2698,6 +2699,9 @@ u32 rtl9300_sds_sym_err_get(int sds_num, phy_interface_t phy_mode)
 		v = rtl930x_read_sds_phy(sds_num, 5, 1);
 		return v & 0xff;
 
+	case PHY_INTERFACE_MODE_1000BASEX:
+		return 0;
+
 	default:
 		pr_info("%s unsupported PHY-mode\n", __func__);
 	}
@@ -2732,6 +2736,8 @@ int rtl9300_sds_check_calibration(int sds_num, phy_interface_t phy_mode)
 				return 1;
 			}
 			break;
+		case PHY_INTERFACE_MODE_1000BASEX:
+			return 0;
 		default:
 			return 1;
 	}
@@ -2798,7 +2804,7 @@ int rtl9300_serdes_setup(int sds_num, phy_interface_t phy_mode)
 	rtl9300_phy_enable_10g_1g(sds_num);
 
 	// Set Serdes Mode
-	rtl9300_sds_set(sds_num, 0x1a);	 // 0x1b: RTK_MII_10GR1000BX_AUTO
+	rtl9300_sds_set(sds_num, sds_mode);	 // 0x1b: RTK_MII_10GR1000BX_AUTO
 
 	// Do RX calibration
 	do {
@@ -2933,6 +2939,73 @@ int rtl9300_sds_cmu_band_get(int sds)
 	return cmu_band;
 }
 
+static int rtl93xx_sfp_insert(void *upstream, const struct sfp_eeprom_id *id)
+{
+	struct phy_device *phydev = upstream;
+	phy_interface_t interface;
+	struct device *dev;
+	int oldpage;
+	int ret = 0;
+	u32 sds_num = 0;
+	int phy_addr;
+	struct device_node *dn;
+
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported) = { 0, };
+
+	dev = &phydev->mdio.dev;
+	phy_addr = phydev->mdio.addr;
+
+	sfp_parse_support(phydev->sfp_bus, id, supported);
+	interface = sfp_select_interface(phydev->sfp_bus, supported);
+
+	dev_info(dev, "%s SFP module inserted\n", phy_modes(interface));
+
+	if (dev->of_node) {
+		dn = dev->of_node;
+		
+		if (of_property_read_u32(dn, "sds", &sds_num))
+			sds_num = -1;
+		dev_info(dev, "%s: Port %d, SerDes is %d\n", __func__, phy_addr, sds_num);
+	} else {
+		dev_err(dev, "No DT node.\n");
+		return -EINVAL;
+	}
+
+	return rtl9300_serdes_setup(sds_num, interface);
+
+error:
+	return rtl9300_serdes_setup(sds_num, PHY_INTERFACE_MODE_10GBASER);
+}
+
+static void rtl93xx_sfp_remove(void *upstream)
+{
+	struct phy_device *phydev = upstream;
+	int ret = 0;
+	u32 sds_num = 0;
+	struct device_node *dn;
+	struct device *dev;
+	int phy_addr;
+
+	dev = &phydev->mdio.dev;
+	phy_addr = phydev->mdio.addr;
+
+	if (dev->of_node) {
+		dn = dev->of_node;
+		
+		if (of_property_read_u32(dn, "sds", &sds_num))
+			sds_num = -1;
+		dev_info(dev, "%s: Port %d, SerDes is %d\n", __func__, phy_addr, sds_num);
+	} else {
+		dev_err(dev, "No DT node.\n");
+		return;
+	}
+
+	rtl9300_serdes_setup(sds_num, PHY_INTERFACE_MODE_10GBASER);
+
+error:
+	rtl9300_serdes_setup(sds_num, PHY_INTERFACE_MODE_10GBASER);
+}
+
 int rtl9300_configure_serdes(struct phy_device *phydev)
 {
 	struct device *dev = &phydev->mdio.dev;
@@ -2949,14 +3022,26 @@ int rtl9300_configure_serdes(struct phy_device *phydev)
 		pr_info("%s: Port %d, SerDes is %d\n", __func__, phy_addr, sds_num);
 	} else {
 		dev_err(dev, "No DT node.\n");
-		return -EINVAL;
+
+		dev = phydev->mdio.bus->parent;
+		if (dev->of_node) {
+			dn = dev->of_node;
+			
+			if (of_property_read_u32(dn, "sds", &sds_num))
+				sds_num = -1;
+			pr_info("%s: Port %d, SerDes is %d\n", __func__, phy_addr, sds_num);
+		} else {
+			dev_err(dev, "No DT node.\n");
+			return -EINVAL;
+		}
 	}
 
-	if (sds_num < 0)
+
+	if ((signed)sds_num < 0)
 		return 0;
 
-	if (phy_mode != PHY_INTERFACE_MODE_10GBASER) // TODO: for now we only patch 10GR SerDes
-		return 0;
+	// if (phy_mode != PHY_INTERFACE_MODE_10GBASER) // TODO: for now we only patch 10GR SerDes
+	// 	return 0;
 
 	switch (phy_mode) {
 	case PHY_INTERFACE_MODE_HSGMII:
@@ -3813,14 +3898,26 @@ static int rtl8390_serdes_probe(struct phy_device *phydev)
 	return rtl8390_configure_generic(phydev);
 }
 
+static const struct sfp_upstream_ops rtl93xx_sfp_ops = {
+	.module_insert = rtl93xx_sfp_insert,
+	.module_remove = rtl93xx_sfp_remove,
+	.attach = phy_sfp_attach,
+	.detach = phy_sfp_detach,
+};
+
 static int rtl9300_serdes_probe(struct phy_device *phydev)
 {
+	int ret;
 	if (soc_info.family != RTL9300_FAMILY_ID)
 		return -ENODEV;
 
 	phydev_info(phydev, "Detected internal RTL9300 Serdes\n");
 
-	return rtl9300_configure_serdes(phydev);
+	ret = rtl9300_configure_serdes(phydev);
+	if(ret)
+		return ret;
+
+	return phy_sfp_probe(phydev, &rtl93xx_sfp_ops);
 }
 
 static struct phy_driver rtl83xx_phy_driver[] = {
