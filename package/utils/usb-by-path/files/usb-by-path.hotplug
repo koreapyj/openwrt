@@ -1,0 +1,24 @@
+#!/bin/sh
+
+[ "$ACTION" = add ] || [ "$ACTION" = remove ] || return 0
+DEVICE_CLASS=`echo "${DEVNAME}" | grep -oE '[^0-9]+'`
+case "${DEVICE_CLASS}" in
+    ttyUSB|\
+    cdc-wdm)
+        ;;
+    *)
+        return 0
+        ;;
+esac
+
+SHORTPATH="usb`echo "${DEVPATH}" | grep -oE '/[0-9:.-]+' | tail -n1 | tail -c+2`"
+
+case "$ACTION" in
+    add)
+        mkdir -p /dev/by-path/${DEVICE_CLASS}
+        ln -s "/dev/${DEVNAME}" "/dev/by-path/${DEVICE_CLASS}/${SHORTPATH}"
+        ;;
+    remove)
+        rm -f "/dev/by-path/${DEVICE_CLASS}/${SHORTPATH}"
+        ;;
+esac

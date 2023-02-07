@@ -96,5 +96,24 @@
 		],
 		"connect": "AT+ZGACT=1,${profile}",
 		"disconnect": "AT+ZGACT=0,${profile}"
+	},
+	"\"mikrotik\"": {
+		"initialize": [
+			"AT+CFUN=4",
+			"AT*CGDFLT=${profile},\\\"${pdptype}\\\",\\\"${apn}\\\",,,,,,,,,,,,,,,,,,1",
+			"AT+CFUN=1"
+		],
+		"configure": [
+		],
+		"modes": {
+			"preferlte": "AT*BAND=11,79,147,480,589829,0,2,0",
+			"preferumts": "AT*BAND=1,79,147,480,589829,0,2,0",
+			"lte": "AT*BAND=5,79,147,480,589829,0,2,0",
+			"umts": "AT*BAND=1,79,147,480,589829,0,2,0",
+			"gsm": "AT*BAND=0,79,147,480,589829,0,2,0",
+			"auto": "AT*BAND=15,79,147,480,589829,0,2,0"
+		},
+		"connect": "AT+CGCONTRDP=5",
+		"disconnect": "AT+CFUN=0"
 	}
 }

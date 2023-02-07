@@ -85,6 +85,53 @@ fi
 # Modem Informations
 if [ "`echo $DEVICE_STATUS | jsonfilter -q -e '@[@.devtype="wwan"].up'`" = "true" ] ; then
   # Currently detailed information is only supported in qmi
+  MM_INTERFACE=`uci show network | grep ".proto='modemmanager'" | sed 's/^network\.\(.*\).proto=.*$/\1/g'`
+  if [ -n "$MM_INTERFACE" ]; then
+    MM_DEVICE=`uci get network.$MM_INTERFACE.device`
+    MM_RESULT_JSON=`mmcli -m $MM_DEVICE --output-json`
+    if [ "`echo $MM_RESULT_JSON | jsonfilter -q -e '@.modem.generic.state'`" = "connected" ] ; then
+      json_add_string "modem_up" "1"
+
+      PLMN_MCCMNC=`echo $MM_RESULT_JSON | jsonfilter -q -e '@.modem["3gpp"]["operator-code"]'`
+      PLMN_DESC=`echo $MM_RESULT_JSON | jsonfilter -q -e '@.modem["3gpp"]["operator-name"]'`
+      if [ -z "$PLMN_DESC" ]; then
+        json_add_string "carrier" "$PLMN_MCCMNC"
+      else
+        json_add_string "carrier" "$PLMN_DESC"
+      fi
+
+      MM_SIGNAL_PERCENT=`echo $MM_RESULT_JSON | jsonfilter -q -e '@.modem.generic["signal-quality"].value'`
+      if [ "$MM_SIGNAL_PERCENT" -gt "80" ]; then
+        json_add_string "signal" "4"
+      elif [ "$MM_SIGNAL_PERCENT" -gt "60" ]; then
+        json_add_string "signal" "3"
+      elif [ "$MM_SIGNAL_PERCENT" -gt "40" ]; then
+        json_add_string "signal" "2"
+      elif [ "$MM_SIGNAL_PERCENT" -gt "20" ]; then
+        json_add_string "signal" "1"
+      else
+        json_add_string "signal" "0"
+      fi
+
+      SIGNAL_TYPE=`echo $MM_RESULT_JSON | jsonfilter -q -e '@.modem.generic["access-technologies"][0]'`
+      case "$SIGNAL_TYPE" in
+        gsm-umts)
+          json_add_string "modem_mode" "3G"
+          ;;
+        lte)
+          json_add_string "modem_mode" "4G"
+          ;;
+        5gnr)
+          json_add_string "modem_mode" "4G+"
+          ;;
+        *)
+          json_add_string "modem_mode" "2G"
+          ;;
+      esac
+    else
+      json_add_string "modem_up" "0"
+    fi
+  fi
   QMI_INTERFACE=`uci show network | grep ".proto='qmi'" | sed 's/^network\.\(.*\).proto=.*$/\1/g'`
   if [ -n "$QMI_INTERFACE" ]; then
     QMI_DEVICE=`uci get network.$QMI_INTERFACE.device`
