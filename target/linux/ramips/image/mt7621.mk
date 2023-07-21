@@ -143,6 +143,20 @@ define Build/zyxel-nwa-fit
 	@mv $@.new $@
 endef
 
+define Build/unielec_u7621-06-ubootmod-u-boot
+	cat $(STAGING_DIR_IMAGE)/mt7621_$1-u-boot-mt7621.bin >> $@
+endef
+
+define Build/unielec_u7621-06-ubootmod-gpt
+	cp $@ $@.tmp 2>/dev/null || true
+	ptgen -v -g -o $@.tmp -a 1 -l 1024 \
+			-t 0x83	-N ubootenv	-r	-p 1M@1M \
+				      -N recovery	-r	-p 32M@2M \
+			-t 0x2e -N production		-p $(CONFIG_TARGET_ROOTFS_PARTSIZE)M@34M
+	cat $@.tmp >> $@
+	rm $@.tmp
+endef
+
 define Device/dsa-migration
   DEVICE_COMPAT_VERSION := 1.1
   DEVICE_COMPAT_MESSAGE := Config cannot be migrated from swconfig to DSA
@@ -2327,15 +2341,29 @@ endef
 TARGET_DEVICES += unielec_u7621-01-16m
 
 define Device/unielec_u7621-06-16m
-  $(Device/dsa-migration)
-  $(Device/uimage-lzma-loader)
-  IMAGE_SIZE := 16064k
   DEVICE_VENDOR := UniElec
   DEVICE_MODEL := U7621-06
   DEVICE_VARIANT := 16M
   DEVICE_PACKAGES := kmod-ata-ahci kmod-sdhci-mt7620 kmod-usb3 \
-	-wpad-basic-mbedtls -uboot-envtools
+	  -wpad-basic-mbedtls
   SUPPORTED_DEVICES += u7621-06-256M-16M unielec,u7621-06-256m-16m
+
+  ARTIFACTS := uboot.fip sdcard.img.gz
+  IMAGES += sysupgrade.itb
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  ARTIFACT/uboot.fip := unielec_u7621-06-ubootmod-u-boot unielec_u7621-06
+  ARTIFACT/sdcard.img.gz := unielec_u7621-06-ubootmod-gpt |\
+    $(if $(CONFIG_TARGET_ROOTFS_INITRAMFS),\
+        pad-to 2048k | append-image-stage initramfs-recovery.itb | check-size 38912k |\
+    ) \
+    $(if $(CONFIG_TARGET_ROOTFS_SQUASHFS), \
+        pad-to 34816k | append-image squashfs-sysupgrade.itb | check-size |\
+    ) \
+        gzip
+  IMAGE_SIZE := $$(shell expr 45 + $$(CONFIG_TARGET_ROOTFS_PARTSIZE))m
+  KERNEL := kernel-bin
+  KERNEL_INITRAMFS := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 128k
+  IMAGE/sysupgrade.itb := append-kernel | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | append-metadata
 endef
 TARGET_DEVICES += unielec_u7621-06-16m
 

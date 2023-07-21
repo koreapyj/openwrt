@@ -64,6 +64,24 @@ define U-Boot/mt7621_rfb
   UBOOT_IMAGE:=u-boot-mt7621.bin
 endef
 
+define U-Boot/mt7621_unielec_u7621-06
+  NAME:=MT7621 Reference Board
+  UBOOT_CONFIG:=mt7621_unielec_u7621-06
+  BUILD_DEVICES:=unielec_u7621-06-16m unielec_u7621-06-32m unielec_u7621-06-64m
+  BUILD_TARGET:=ramips
+  BUILD_SUBTARGET:=mt7621
+  UBOOT_IMAGE:=u-boot-mt7621.bin
+endef
+
+define U-Boot/mt7621_yuncore_ax820
+  NAME:=MT7621 Reference Board
+  UBOOT_CONFIG:=mt7621_yuncore_ax820
+  BUILD_DEVICES:=yuncore_ax820
+  BUILD_TARGET:=ramips
+  BUILD_SUBTARGET:=mt7621
+  UBOOT_IMAGE:=u-boot-mt7621.bin
+endef
+
 define U-Boot/mt7621_nand_rfb
   NAME:=MT7621 Reference Board (NAND)
   UBOOT_CONFIG:=mt7621_nand_rfb
@@ -302,6 +320,8 @@ UBOOT_TARGETS := \
 	mt7620_rfb \
 	mt7621_nand_rfb \
 	mt7621_rfb \
+  mt7621_unielec_u7621-06 \
+  mt7621_yuncore_ax820 \
 	mt7622_bananapi_bpi-r64-emmc \
 	mt7622_bananapi_bpi-r64-sdmmc \
 	mt7622_bananapi_bpi-r64-snand \
