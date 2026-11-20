@@ -1,0 +1,70 @@
+usb: host: ehci-msm: reset the controller before gating its clocks
+
+ehci_usb_remove() disabled the iface/core clocks and shut down the PHY and
+only then wrote CMD_RESET to the controller. On MSM8916 an access to an
+unclocked controller hangs the bus and the watchdog resets the board. It is
+hit whenever a gadget is unregistered (usb_gadget_unregister_driver() ->
+usb_remove_ehci_gadget() -> device_remove()), e.g. when fastboot exits. Do the
+stop/reset first, clean up after.
+
+---
+--- a/drivers/usb/host/ehci-msm.c
++++ b/drivers/usb/host/ehci-msm.c
+@@ -102,36 +102,41 @@
+ {
+ 	struct msm_ehci_priv *p = dev_get_priv(dev);
+ 	struct usb_ehci *ehci = p->ehci;
+-	int ret;
++	int ret, ret2;
+ 
+ 	ret = ehci_deregister(dev);
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Stop controller. */
++	/*
++	 * The controller registers must only be accessed while the clocks are
++	 * running: stop and reset the controller first, then gate the PHY and
++	 * the clocks. Resetting it after the clocks were disabled hangs the
++	 * bus (watchdog reset) when a gadget is unregistered.
++	 */
+ 	clrbits_le32(&ehci->usbcmd, CMD_RUN);
+ 
+-	clk_disable_unprepare(&p->iface_clk);
+-	clk_disable_unprepare(&p->core_clk);
+-
+-	ret = generic_shutdown_phy(&p->phy);
+-	if (ret)
+-		return ret;
+-
+-	ret = board_usb_init(0, USB_INIT_DEVICE); /* Board specific hook */
+-	if (ret < 0)
+-		return ret;
+-
+ 	/* Reset controller */
+ 	setbits_le32(&ehci->usbcmd, CMD_RESET);
+ 
+ 	/* Wait for reset */
+-	if (wait_for_bit_le32(&ehci->usbcmd, CMD_RESET, false, 30, false)) {
++	ret = wait_for_bit_le32(&ehci->usbcmd, CMD_RESET, false, 30, false);
++	if (ret) {
+ 		printf("Stuck on USB reset.\n");
+-		return -ETIMEDOUT;
++		ret = -ETIMEDOUT;
+ 	}
+ 
+-	return 0;
++	ret2 = generic_shutdown_phy(&p->phy);
++
++	clk_disable_unprepare(&p->iface_clk);
++	clk_disable_unprepare(&p->core_clk);
++
++	if (ret)
++		return ret;
++	if (ret2)
++		return ret2;
++
++	return board_usb_init(0, USB_INIT_DEVICE) < 0 ? -EIO : 0; /* Board specific hook */
+ }
+ 
+ static int ehci_usb_of_to_plat(struct udevice *dev)

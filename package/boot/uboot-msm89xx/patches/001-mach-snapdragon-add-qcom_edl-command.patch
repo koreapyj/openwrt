@@ -1,0 +1,239 @@
+mach-snapdragon: add a command to reboot into EDL mode
+
+Add "qcom_edl", which reboots an MSM8916/APQ8016 SoC into Qualcomm Emergency
+Download mode (EDL, USB 05c6:9008). It mirrors Qualcomm's LK (and lk2nd)
+"reboot-edl" path (platform/msm_shared/scm.c: scm_dload_mode(EMERGENCY_DLOAD),
+platform/msm_shared/reboot.c: reboot_device()):
+
+ - TrustZone SCM call SCM_SVC_BOOT (0x01) / SCM_DLOAD_CMD (0x10) with
+   arg1 = SCM_EDLOAD_MODE (0x01), arg2 = 0 (SMC32 SIP convention, standard
+   call), falling back to SCM_SVC_IO (0x05) / SCM_IO_WRITE (0x02) of the same
+   value to TCSR_BOOT_MISC_DETECT (0x193d100)
+ - disable the PM8916 watchdog, configure PS_HOLD for a warm reset, halt the
+   PMIC arbiter through SCM_SVC_PWR and drop MPM2_MPM_PS_HOLD (0x4ab000)
+
+PBL then sees the cookie after the warm reset and starts EDL instead of SBL.
+
+
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/edl.c
+@@ -0,0 +1,169 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Reboot into Qualcomm Emergency Download (EDL) mode on MSM8916/APQ8016
++ *
++ * This mirrors what Qualcomm's LK (and lk2nd) do for "reboot-edl":
++ *
++ *  1. platform/msm_shared/scm.c, scm_dload_mode(EMERGENCY_DLOAD): TZ SCM call
++ *     SCM_SVC_BOOT (0x01) / SCM_DLOAD_CMD (0x10) with arg1 = SCM_EDLOAD_MODE
++ *     (0x01), arg2 = 0. LK only uses it if TZ reports it as available and
++ *     otherwise writes SCM_EDLOAD_MODE to TCSR_BOOT_MISC_DETECT (0x193d100)
++ *     with the SCM_SVC_IO (0x05) / SCM_IO_WRITE (0x02) call.
++ *  2. platform/msm_shared/reboot.c, reboot_device(): disable the PMIC
++ *     watchdog, configure PS_HOLD for a *warm* reset, halt the PMIC arbiter
++ *     and drop PS_HOLD (MPM2_MPM_PS_HOLD, 0x004ab000).
++ *
++ * PBL looks at the download cookie after the warm reset and goes to EDL.
++ *
++ * LK also issues SCM_SVC_BOOT/WDOG_DEBUG_DISABLE afterwards; it only does so
++ * on devices with the secure boot debug fuse set, which is not the case on
++ * the devices that can run a test-signed (qtestsign) bootloader, so it is
++ * left out.
++ */
++
++#include <command.h>
++#include <dm.h>
++#include <log.h>
++#include <power/pmic.h>
++#include <asm/io.h>
++#include <linux/arm-smccc.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <mach/edl.h>
++
++#define SCM_SVC_BOOT			0x01
++#define SCM_SVC_IO			0x05
++#define SCM_SVC_INFO			0x06
++#define SCM_SVC_PWR			0x09
++
++#define SCM_DLOAD_CMD			0x10
++#define SCM_IO_READ			0x01
++#define SCM_IO_WRITE			0x02
++#define SCM_IS_CALL_AVAIL_CMD		0x01
++#define SCM_IO_DISABLE_PMIC_ARBITER	0x01
++#define SCM_IO_DISABLE_PMIC_ARBITER1	0x02
++
++#define SCM_EDLOAD_MODE			0x01
++
++/* msm8916: TCSR_BOOT_MISC_DETECT and MPM2_MPM_PS_HOLD */
++#define TCSR_BOOT_MISC_DETECT		0x0193d100
++#define MPM2_MPM_PS_HOLD		0x004ab000
++
++/* PM8916 PON peripheral (SPMI SID 0, PID 0x08) */
++#define PMIC_WD_RESET_S2_CTL2		0x857
++#define PON_PS_HOLD_RESET_CTL		0x85a
++#define PON_PS_HOLD_RESET_CTL2		0x85b
++#define PON_PSHOLD_WARM_RESET		0x1
++#define S2_RESET_EN			BIT(7)
++
++/* SCM "ARM" calling convention: SMC32, SIP owner, number of arguments in x1 */
++static int qcom_scm_call(u32 svc, u32 cmd, bool atomic, u32 nargs,
++			 ulong a2, ulong a3, struct arm_smccc_res *res)
++{
++	u32 id = ARM_SMCCC_CALL_VAL(atomic ? ARM_SMCCC_FAST_CALL :
++					     ARM_SMCCC_STD_CALL,
++				    ARM_SMCCC_SMC_32, ARM_SMCCC_OWNER_SIP,
++				    (svc << 8) | cmd);
++
++	arm_smccc_smc(id, nargs, a2, a3, 0, 0, 0, 0, res);
++
++	return (int)res->a0;
++}
++
++static bool qcom_scm_is_available(u32 svc, u32 cmd)
++{
++	struct arm_smccc_res res;
++	u32 id = ARM_SMCCC_CALL_VAL(ARM_SMCCC_STD_CALL, ARM_SMCCC_SMC_32,
++				    ARM_SMCCC_OWNER_SIP, (svc << 8) | cmd);
++
++	if (qcom_scm_call(SCM_SVC_INFO, SCM_IS_CALL_AVAIL_CMD, false, 1, id,
++			  0, &res))
++		return false;
++
++	return res.a1 > 0;
++}
++
++static int qcom_scm_dload_mode(u32 mode)
++{
++	struct arm_smccc_res res;
++	int ret;
++
++	/*
++	 * Ask TZ first like LK does, but do not rely on it: the DragonBoard
++	 * TZ (TZ.BF.3.0) does not offer this call at all.
++	 * Always write the cookie PBL reads to TCSR_BOOT_MISC_DETECT as well.
++	 */
++	if (qcom_scm_is_available(SCM_SVC_BOOT, SCM_DLOAD_CMD))
++		qcom_scm_call(SCM_SVC_BOOT, SCM_DLOAD_CMD, false, 2, mode, 0,
++			      &res);
++
++	ret = qcom_scm_call(SCM_SVC_IO, SCM_IO_WRITE, true, 2,
++			    TCSR_BOOT_MISC_DETECT, mode, &res);
++	if (!qcom_scm_call(SCM_SVC_IO, SCM_IO_READ, true, 1,
++			   TCSR_BOOT_MISC_DETECT, 0, &res))
++		printf("EDL: TCSR_BOOT_MISC_DETECT = 0x%lx\n", res.a1);
++
++	return ret ? -EIO : 0;
++}
++
++static void qcom_scm_halt_pmic_arbiter(void)
++{
++	struct arm_smccc_res res;
++
++	if (!qcom_scm_is_available(SCM_SVC_PWR, SCM_IO_DISABLE_PMIC_ARBITER))
++		return;
++
++	if (qcom_scm_call(SCM_SVC_PWR, SCM_IO_DISABLE_PMIC_ARBITER, true, 1,
++			  0, 0, &res))
++		qcom_scm_call(SCM_SVC_PWR, SCM_IO_DISABLE_PMIC_ARBITER1, true,
++			      1, 0, 0, &res);
++}
++
++int qcom_edl_reboot(void)
++{
++	struct udevice *pmic;
++	int ret;
++
++	/* PM8916 is the first (SID 0) PMIC on the SPMI bus */
++	ret = uclass_first_device_err(UCLASS_PMIC, &pmic);
++	if (ret) {
++		printf("EDL: no PMIC found: %d\n", ret);
++		return ret;
++	}
++
++	ret = qcom_scm_dload_mode(SCM_EDLOAD_MODE);
++	if (ret) {
++		printf("EDL: failed to set the download mode cookie\n");
++		return ret;
++	}
++
++	/* Disable the PMIC watchdog, then PS_HOLD reset = warm reset */
++	pmic_reg_write(pmic, PMIC_WD_RESET_S2_CTL2, 0);
++	pmic_reg_write(pmic, PON_PS_HOLD_RESET_CTL2, 0);
++	udelay(300);
++	pmic_reg_write(pmic, PON_PS_HOLD_RESET_CTL, PON_PSHOLD_WARM_RESET);
++	pmic_reg_write(pmic, PON_PS_HOLD_RESET_CTL2, S2_RESET_EN);
++
++	/* SPMI must not be used any more after this (avoids an arbiter lockup) */
++	qcom_scm_halt_pmic_arbiter();
++
++	writel(0, MPM2_MPM_PS_HOLD);
++	mdelay(5000);
++
++	printf("EDL: reset failed\n");
++
++	return -ETIMEDOUT;
++}
++
++static int do_qcom_edl(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	printf("Rebooting into Emergency Download mode...\n");
++	mdelay(50);
++
++	return qcom_edl_reboot() ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(qcom_edl, 1, 0, do_qcom_edl,
++	   "reboot into Qualcomm Emergency Download (EDL, USB 9008) mode",
++	   "- sets the download cookie through TrustZone and warm resets the SoC");
+--- /dev/null
++++ b/arch/arm/mach-snapdragon/include/mach/edl.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Reboot into Qualcomm Emergency Download (EDL) mode on MSM8916
++ */
++
++#ifndef __MACH_SNAPDRAGON_EDL_H__
++#define __MACH_SNAPDRAGON_EDL_H__
++
++/**
++ * qcom_edl_reboot() - reset the SoC into Emergency Download (EDL) mode
++ *
++ * Asks TrustZone to set the "emergency download" cookie and resets the SoC
++ * through the PMIC (warm reset), which makes the primary bootloader (PBL)
++ * enter EDL (USB 05c6:9008) instead of loading SBL.
++ *
++ * Return: only returns (with a negative errno) if the reset failed
++ */
++int qcom_edl_reboot(void);
++
++#endif /* __MACH_SNAPDRAGON_EDL_H__ */
+--- a/arch/arm/mach-snapdragon/Kconfig
++++ b/arch/arm/mach-snapdragon/Kconfig
+@@ -29,6 +29,15 @@
+ config LNX_KRNL_IMG_TEXT_OFFSET_BASE
+ 	default 0x80000000
+ 
++config CMD_QCOM_EDL
++	bool "qcom_edl - reboot into Qualcomm Emergency Download mode"
++	depends on DM_PMIC
++	help
++	  Adds the 'qcom_edl' command which asks TrustZone to set the
++	  emergency download cookie and then warm resets the SoC through the
++	  PM8916 PMIC so that the primary bootloader enters EDL (USB 9008).
++	  This mirrors LK's "reboot-edl" and is only valid on MSM8916/APQ8016.
++
+ config SYS_BOARD
+ 	string "Snapdragon SoCs based board"
+ 	help
+--- a/arch/arm/mach-snapdragon/Makefile
++++ b/arch/arm/mach-snapdragon/Makefile
+@@ -3,5 +3,6 @@
+ # (C) Copyright 2015 Mateusz Kulikowski <mateusz.kulikowski@gmail.com>
+ 
+ obj-y += board.o
++obj-$(CONFIG_CMD_QCOM_EDL) += edl.o
+ obj-$(CONFIG_EFI_HAVE_CAPSULE_SUPPORT) += capsule_update.o
+ obj-$(CONFIG_OF_LIVE) += of_fixup.o

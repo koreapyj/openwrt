@@ -1,0 +1,124 @@
+fastboot: add "oem edl" and "reboot-edl" commands
+
+Reboot into Qualcomm Emergency Download mode (see "qcom_edl") on request of
+the fastboot client. The response is sent first, the reboot is done from the
+completion callback of the response like for the other reboot commands.
+
+
+--- a/drivers/fastboot/Kconfig
++++ b/drivers/fastboot/Kconfig
+@@ -264,6 +264,14 @@
+ 	  command allows running vendor custom code defined in board/ files.
+ 	  Otherwise, it will do nothing and send fastboot fail.
+ 
++config FASTBOOT_CMD_OEM_EDL
++	bool "Enable the 'oem edl' and 'reboot-edl' commands"
++	depends on CMD_QCOM_EDL
++	help
++	  Add support for the "oem edl" and "reboot-edl" commands from a
++	  client. They reboot the device into Qualcomm Emergency Download
++	  (EDL) mode like the "qcom_edl" command does.
++
+ endif # FASTBOOT
+ 
+ endmenu
+--- a/drivers/fastboot/fb_command.c
++++ b/drivers/fastboot/fb_command.c
+@@ -44,6 +44,7 @@
+ static void oem_bootbus(char *, char *);
+ static void oem_console(char *, char *);
+ static void oem_board(char *, char *);
++static void reboot_edl(char *, char *);
+ static void run_ucmd(char *, char *);
+ static void run_acmd(char *, char *);
+ 
+@@ -119,6 +120,14 @@
+ 		.command = "oem board",
+ 		.dispatch = CONFIG_IS_ENABLED(FASTBOOT_OEM_BOARD, (oem_board), (NULL))
+ 	},
++	[FASTBOOT_COMMAND_OEM_EDL] = {
++		.command = "oem edl",
++		.dispatch = CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_EDL, (reboot_edl), (NULL))
++	},
++	[FASTBOOT_COMMAND_REBOOT_EDL] = {
++		.command = "reboot-edl",
++		.dispatch = CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_EDL, (reboot_edl), (NULL))
++	},
+ 	[FASTBOOT_COMMAND_UCMD] = {
+ 		.command = "UCmd",
+ 		.dispatch = CONFIG_IS_ENABLED(FASTBOOT_UUU_SUPPORT, (run_ucmd), (NULL))
+@@ -438,6 +447,19 @@
+ }
+ 
+ /**
++ * reboot_edl() - Acknowledge a reboot into Emergency Download mode.
++ *
++ * The reboot itself is done by the transport once the response was sent.
++ *
++ * @cmd_parameter: Pointer to command parameter
++ * @response: Pointer to fastboot response buffer
++ */
++static void __maybe_unused reboot_edl(char *cmd_parameter, char *response)
++{
++	fastboot_okay(NULL, response);
++}
++
++/**
+  * reboot_fastbootd() - Sets reboot fastboot flag.
+  *
+  * @cmd_parameter: Pointer to command parameter
+--- a/drivers/usb/gadget/f_fastboot.c
++++ b/drivers/usb/gadget/f_fastboot.c
+@@ -22,6 +22,9 @@
+ #include <linux/usb/composite.h>
+ #include <linux/compiler.h>
+ #include <g_dnl.h>
++#if CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_EDL)
++#include <mach/edl.h>
++#endif
+ 
+ #define FASTBOOT_INTERFACE_CLASS	0xff
+ #define FASTBOOT_INTERFACE_SUB_CLASS	0x42
+@@ -425,6 +428,18 @@
+ 	do_reset(NULL, 0, 0, NULL);
+ }
+ 
++#if CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_EDL)
++/*
++ * Do not unregister the gadget here: tearing the controller down from its own
++ * completion callback resets the board before the EDL cookie is written, and
++ * the SoC is reset right afterwards anyway.
++ */
++static void compl_do_edl(struct usb_ep *ep, struct usb_request *req)
++{
++	qcom_edl_reboot();
++}
++#endif
++
+ static unsigned int rx_bytes_expected(struct usb_ep *ep)
+ {
+ 	int rx_remain = fastboot_data_remaining();
+@@ -573,6 +584,12 @@
+ 		case FASTBOOT_COMMAND_REBOOT_RECOVERY:
+ 			fastboot_func->in_req->complete = compl_do_reset;
+ 			break;
++#if CONFIG_IS_ENABLED(FASTBOOT_CMD_OEM_EDL)
++		case FASTBOOT_COMMAND_OEM_EDL:
++		case FASTBOOT_COMMAND_REBOOT_EDL:
++			fastboot_func->in_req->complete = compl_do_edl;
++			break;
++#endif
+ 		case FASTBOOT_COMMAND_ACMD:
+ 			if (CONFIG_IS_ENABLED(FASTBOOT_UUU_SUPPORT))
+ 				fastboot_func->in_req->complete = do_acmd_complete;
+--- a/include/fastboot.h
++++ b/include/fastboot.h
+@@ -51,6 +51,8 @@
+ 	FASTBOOT_COMMAND_OEM_RUN,
+ 	FASTBOOT_COMMAND_OEM_CONSOLE,
+ 	FASTBOOT_COMMAND_OEM_BOARD,
++	FASTBOOT_COMMAND_OEM_EDL,
++	FASTBOOT_COMMAND_REBOOT_EDL,
+ 	FASTBOOT_COMMAND_ACMD,
+ 	FASTBOOT_COMMAND_UCMD,
+ 	FASTBOOT_COMMAND_COUNT

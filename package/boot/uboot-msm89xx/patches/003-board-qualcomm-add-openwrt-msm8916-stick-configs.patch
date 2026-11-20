@@ -1,0 +1,241 @@
+board: qualcomm: add OpenWrt MSM8916 stick configurations
+
+Add the pieces needed to run U-Boot as the aboot replacement on the 512 MiB
+MSM8916 "UFI" 4G modem sticks, on top of dragonboard410c_defconfig:
+
+ - configs/msm89xx-openwrt.config: common config fragment (built-in default
+   environment saved in the eMMC boot1 partition, small heap/fastboot buffer
+   for 512 MiB, FIT image boot flow, fastboot, EDL commands, gpio
+   LED and button with software blinking, pstore panic check). There is no
+   console (no UART header, USB is used for fastboot only)
+ - configs/msm89xx-*.config: per-device default devicetree
+ - board/qualcomm/msm89xx-openwrt.env: default environment; boots the FIT
+   image from the "boot" partition, the recovery image (OpenWrt
+   initramfs) from the "recovery" partition after a button press during the
+   LED-flashing failsafe wait or a panic record in pstore, and ends up in
+   fastboot with a slowly blinking LED when both fail
+ - msm8916-ufi-esim.dts: bootloader devicetree of the UFI eSIM stick (not
+   upstream)
+ - *-u-boot.dtsi: fixed 512 MiB /memory (no SMEM RAM detection when running
+   as first-stage bootloader), UART pinctrl for all boot stages and the
+   ramoops reserved-memory node
+
+---
+--- /dev/null
++++ b/arch/arm/dts/msm8916-ufi-esim-u-boot.dtsi
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * U-Boot additions for the 512 MiB MSM8916 "UFI" 4G modem sticks.
++ */
++
++/ {
++	/*
++	 * When running as a first-stage bootloader the memory is not filled in
++	 * automatically (U-Boot does not probe SMEM for it). Both sticks ship
++	 * 512 MiB of RAM ("msm8916_32_512" stock firmware).
++	 */
++	memory@80000000 {
++		reg = <0 0x80000000 0 0x20000000>;
++	};
++
++	reserved-memory {
++		/*
++		 * Linux panic log (pstore/ramoops, same node as in the kernel
++		 * devicetree), checked by "pstore check" in the boot script.
++		 * Kept away from U-Boot's lmb so that nothing overwrites it.
++		 * 0x8c100000 is in the 5 MiB hole between the mpss region of
++		 * the SoC devicetree (ends at 0x8bd00000) and the lowest
++		 * allocation of U-Boot's own windows (starts at 0x8c200000).
++		 */
++		ramoops@8c100000 {
++			compatible = "ramoops";
++			reg = <0 0x8c100000 0 0x20000>;
++			no-map;
++			record-size = <0x4000>;
++			console-size = <0x4000>;
++		};
++	};
++};
++
++/*
++ * SBL de-initialises the UART pins, so they have to be configured again in
++ * all boot stages.
++ */
++&blsp_uart2_console_default {
++	bootph-all;
++};
+--- /dev/null
++++ b/board/qualcomm/msm89xx-openwrt.env
+@@ -0,0 +1,61 @@
++# SPDX-License-Identifier: GPL-2.0+
++# Lines starting with # are the only comments the default environment generator
++# strips.
++#
++# Default environment of the OpenWrt MSM8916 ("msm89xx") U-Boot builds.
++# It is built in; the saved copy lives in the eMMC hardware boot partition
++# boot1 (see the msm89xx-openwrt.config fragment) and is created from this
++# default by "preboot" when the partition is blank or invalid. A saved copy
++# is used as is, so a changed default only takes effect after it was
++# discarded ("env default -a; saveenv" or erasing boot1).
++#
++# There is no console: the sticks have no UART header, and the USB port is
++# only used for fastboot. The LED is the only user interface. Boot flow
++# (compare the BPi-R3/R4 environments of uboot-mediatek):
++#
++#  1. the red power LED is switched on and stays on into Linux, which takes
++#     it over (led-boot/led-running). If the button is already held at this
++#     point, the board enters EDL ("check_edl_button"): the UFI does that in
++#     the boot ROM already (its button is the force-download pin), the UZ801
++#     has no hardware EDL entry, so both behave the same
++#  2. "fw_setenv bootmode fastboot" in Linux requests fastboot once: the flag
++#     is cleared before it is acted upon
++#  3. like the OpenWrt preinit failsafe wait (lib/preinit/30_failsafe_wait),
++#     the LED flashes fast for two seconds while the button is polled; when
++#     it is pressed, boot the recovery image, fastboot as the last resort.
++#  4. a panic record in pstore (ramoops, see CMD_PSTORE_*) selects recovery
++#  5. production image, recovery image, fastboot
++#
++# The "boot" and "recovery" GPT partitions both hold a FIT image (gzip
++# compressed kernel + devicetree, configuration config-1; the recovery one is
++# an OpenWrt initramfs kernel). The FIT is a devicetree blob itself, so
++# "fit_load" reads the first sector, checks the magic ("fdt addr"), takes the
++# image size from the totalsize header field, checks that it fits into the
++# partition and reads the whole image. bootm decompresses the kernel; the
++# kernel command line is not in the image but set per boot path in "bootargs".
++#
++# Every way into fastboot (boot failure, flag, button) goes through
++# boot_fastboot, which flashes the LED slowly for as long as fastboot runs
++# and resets the board when it ends. "qcom_edl" reboots into EDL (also
++# "fastboot oem edl").
++#
++# To count failed boots instead of looking for a panic record (when the RAM
++# does not survive the reboot) replace the pstore line in bootcmd by
++# CONFIG_BOOTCOUNT_LIMIT/CONFIG_BOOTCOUNT_ENV with bootlimit and
++# altbootcmd=run boot_recovery; run boot_fastboot, and reset the counter from
++# Linux like target/linux/mediatek/filogic/base-files/etc/init.d/bootcount.
++bootdelay=0
++preboot=env info -d -q && saveenv
++bootled=red:power
++boot_part=boot
++# The FIT is read to ramdisk_addr_r: ${loadaddr} lies right below the kernel
++# load address (0x80080000), so unpacking the kernel would overwrite the FIT.
++fit_load=mmc dev 0 && part start mmc 0 ${boot_part} fit_start && part size mmc 0 ${boot_part} fit_psize && mmc read ${ramdisk_addr_r} ${fit_start} 1 && fdt addr ${ramdisk_addr_r} && fdt header get fit_size totalsize && setexpr fit_cnt ${fit_size} + 0x1ff && setexpr fit_cnt ${fit_cnt} / 0x200 && test ${fit_cnt} -le ${fit_psize} && mmc read ${ramdisk_addr_r} ${fit_start} ${fit_cnt}
++fit_boot=run fit_load && bootm ${ramdisk_addr_r}#config-1
++boot_production=setenv bootargs console=ttyMSM0,115200 root=PARTLABEL=userdata rootwait; setenv boot_part boot; run fit_boot
++boot_recovery=setenv bootargs console=ttyMSM0,115200; setenv boot_part recovery; run fit_boot
++boot_fastboot=led ${bootled} blink 1000; fastboot -l ${fastboot_addr_r} usb 0; led ${bootled} on; reset
++check_edl_button=if button Restart; then led ${bootled} blink 1000; qcom_edl; fi
++check_fastboot_flag=if test x${bootmode} = xfastboot; then setenv bootmode; saveenv; run boot_fastboot; fi
++check_buttons=led ${bootled} blink 100; setenv bootbtn; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do if button Restart; then setenv bootbtn 1; fi; sleep 0.1; done; led ${bootled} on; if test x${bootbtn} = x1; then setenv bootbtn; run boot_recovery; run boot_fastboot; fi
++bootcmd=led ${bootled} on; run check_edl_button; run check_fastboot_flag; run check_buttons; if pstore check; then run boot_recovery; fi; run boot_production; run boot_recovery; run boot_fastboot
+--- /dev/null
++++ b/configs/msm89xx-openwrt.config
+@@ -0,0 +1,51 @@
++# Common part of the OpenWrt MSM8916 builds, applied on dragonboard410c_defconfig
++CONFIG_IDENT_STRING="\nOpenWrt MSM8916"
++CONFIG_SYS_PROMPT="msm8916 => "
++# memory: 512 MiB boards, the default 256 MiB heap and 112 MiB fastboot buffer
++# leave no room for the ${kernel_addr_r}/${ramdisk_addr_r} windows of board.c
++CONFIG_SYS_MALLOC_LEN=0x2000000
++CONFIG_FASTBOOT_BUF_SIZE=0x2000000
++# Environment: built-in default text file; saved copy in the eMMC hardware boot
++# partition boot1 (partition 2, as dragonboard410c_defconfig), two redundant
++# copies of 16 KiB at 0x0 and 0x4000 (fw_env.config of uboot-envtools). A blank
++# (zero) or corrupt partition fails the CRC check and the default is used.
++CONFIG_ENV_IS_IN_MMC=y
++# CONFIG_ENV_IS_NOWHERE is not set
++CONFIG_ENV_MMC_EMMC_HW_PARTITION=2
++CONFIG_ENV_SIZE=0x4000
++CONFIG_ENV_OFFSET=0x0
++CONFIG_ENV_REDUNDANT=y
++CONFIG_ENV_OFFSET_REDUND=0x4000
++CONFIG_CMD_SAVEENV=y
++CONFIG_CMD_NVEDIT_INFO=y
++CONFIG_ENV_USE_DEFAULT_ENV_TEXT_FILE=y
++CONFIG_ENV_DEFAULT_ENV_TEXT_FILE="board/qualcomm/msm89xx-openwrt.env"
++# FIT image boot flow of fit_load/fit_boot
++CONFIG_CMD_PART=y
++CONFIG_CMD_SETEXPR=y
++CONFIG_CMD_FDT=y
++# fastboot (the only USB function, no console) and EDL
++CONFIG_USB_GADGET_DOWNLOAD=y
++CONFIG_FASTBOOT_OEM_RUN=y
++CONFIG_CMD_QCOM_EDL=y
++CONFIG_FASTBOOT_CMD_OEM_EDL=y
++# no autoboot delay: the button/failsafe wait is part of the boot script
++CONFIG_BOOTDELAY=0
++# red power LED (gpio-leds) as the only user interface, the fastboot blink
++# pattern is done in software (the GPIO LEDs have no hardware blinking)
++CONFIG_LED_SW_BLINK=y
++CONFIG_CMD_LED=y
++# gpio-keys button
++CONFIG_BUTTON_GPIO=y
++CONFIG_CMD_BUTTON=y
++CONFIG_CMD_SLEEP=y
++# panic record check ("pstore check"): ramoops region reserved in the
++# devicetrees (msm8916-*-u-boot.dtsi and the kernel DTS), 128 KiB: seven 16 KiB
++# panic/oops records and a 16 KiB console log (no ftrace, no pmsg)
++CONFIG_CMD_PSTORE=y
++CONFIG_CMD_PSTORE_MEM_ADDR=0x8c100000
++CONFIG_CMD_PSTORE_MEM_SIZE=0x20000
++CONFIG_CMD_PSTORE_RECORD_SIZE=0x4000
++CONFIG_CMD_PSTORE_CONSOLE_SIZE=0x4000
++CONFIG_CMD_PSTORE_FTRACE_SIZE=0
++CONFIG_CMD_PSTORE_PMSG_SIZE=0
+--- /dev/null
++++ b/configs/msm89xx-ufi-esim.config
+@@ -0,0 +1,2 @@
++# UFI 4G modem stick (eSIM variant), 512 MiB RAM
++CONFIG_DEFAULT_DEVICE_TREE="qcom/msm8916-ufi-esim"
+--- /dev/null
++++ b/dts/upstream/src/arm64/qcom/msm8916-ufi-esim.dts
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MSM8916 "UFI" 4G modem stick, eSIM-switching variant.
++ * Trimmed copy of the OpenWrt kernel devicetree for U-Boot: only what the
++ * bootloader needs (console, eMMC, USB, button and LEDs).
++ * Stock firmware: Android 4.4.4 "msm8916_32_512", vendor devicetree
++ * "MSM 8916 512MB MTP".
++ */
++
++/dts-v1/;
++
++#include "msm8916-ufi.dtsi"
++
++/ {
++	model = "UFI 4G Modem Stick (eSIM variant)";
++	compatible = "generic,ufi-esim", "qcom,msm8916";
++};
++
++&button_restart {
++	gpios = <&tlmm 37 GPIO_ACTIVE_HIGH>;
++};
++
++&button_default {
++	pins = "gpio37";
++	bias-pull-down;
++};
++
++/* green: stock "4g_1" */
++&led_g {
++	gpios = <&tlmm 71 GPIO_ACTIVE_HIGH>;
++	function = LED_FUNCTION_WAN;
++};
++
++/* red: stock "4g_type"; power */
++&led_r {
++	gpios = <&tlmm 72 GPIO_ACTIVE_HIGH>;
++	function = LED_FUNCTION_POWER;
++};
++
++/* blue: stock "wifistatus" */
++&led_b {
++	gpios = <&tlmm 73 GPIO_ACTIVE_HIGH>;
++	function = LED_FUNCTION_WLAN;
++};
++
++&gpio_leds_default {
++	pins = "gpio71", "gpio72", "gpio73";
++};
