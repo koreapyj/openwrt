@@ -1,0 +1,64 @@
+#!/bin/sh /etc/rc.common
+# AP side IMS stack. Opt-in: set enabled=1 in /etc/config/imsd.
+# imsd reads /etc/config/imsd itself (libuci); SIGHUP makes it re-read the file and it
+# registers again only if a relevant option changed.
+START=95
+STOP=10
+USE_PROCD=1
+
+# MMS attachments: imsd writes them to the tmpfs directory mms_dir; the web server (uhttpd, document root /www, symlinks followed
+# by default) serves it as /imsd-mms/ through this link. Removing the link on stop is not needed (a dangling link is harmless).
+mms_symlink() {
+	local mms mms_dir
+
+	config_get_bool mms main mms 1
+	config_get mms_dir main mms_dir /tmp/imsd-mms
+	[ "$mms" = 1 ] && [ -d /www ] || return 0
+	mkdir -p "$mms_dir"
+	ln -sfn "$mms_dir" /www/imsd-mms
+}
+
+# The message store (uci store, store_dir; also holds the LAN bindings file, uci lan_persist): persistent, on flash. Created here with mode 0700; imsd does not create the parent.
+store_dir() {
+	local store lan_persist store_dir
+
+	config_get_bool store main store 1
+	config_get_bool lan_persist main lan_persist 1
+	config_get store_dir main store_dir /srv/imsd
+	[ "$store" = 1 ] || [ "$lan_persist" = 1 ] || return 0
+	mkdir -p "$store_dir" && chmod 0700 "$store_dir"
+}
+
+start_service() {
+	local enabled
+
+	config_load imsd
+	config_get_bool enabled main enabled 0
+	[ "$enabled" = 1 ] || return 0
+	mms_symlink
+	store_dir
+
+	procd_open_instance imsd
+	procd_set_param command /usr/sbin/imsd
+	# threshold 3600 s, timeout 5 s between retries, at most 10 quick respawns
+	procd_set_param respawn 3600 5 10
+	procd_close_instance
+}
+
+reload_service() {
+	local enabled
+
+	config_load imsd
+	config_get_bool enabled main enabled 0
+	if [ "$enabled" = 1 ] && procd_running imsd imsd; then
+		mms_symlink
+		store_dir
+		procd_send_signal imsd imsd HUP
+	else
+		restart
+	fi
+}
+
+service_triggers() {
+	procd_add_reload_trigger imsd
+}

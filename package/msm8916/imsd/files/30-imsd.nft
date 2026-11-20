@@ -1,0 +1,34 @@
+# imsd: let the IMS IPsec traffic through the input chain (fw4 include, chain-pre/input,
+# i.e. before the zone rules and the policy).
+#
+# The IMS netdev is created dynamically by the modem manager (wwan0, wwan1, ... after every
+# modem restart) and belongs to no firewall zone, so nothing here may name an interface.
+# The network side opens the TS 33.203 security association towards us:
+#   - ESP packets (IP protocol 50) from the P-CSCF, and
+#   - what the kernel hands to the input chain after ESP decapsulation (SIP over UDP on the
+#     protected server port): `meta ipsec exists` is true only for packets that came out of
+#     an SA.
+# Neither can be forged from outside: an ESP packet is only accepted by the kernel if it
+# matches an SA imsd installed (SPI, addresses, ICV with the key that only the SIM and the
+# P-CSCF share), and `meta ipsec exists` only matches the decapsulated result of such an SA.
+# imsd installs SAs for the P-CSCF address only, with port selectors, and removes them when
+# it stops. Plain, unprotected packets get no exception here.
+meta l4proto esp accept comment "!imsd: IPsec ESP (only SAs installed by imsd are accepted by the kernel)"
+meta ipsec exists accept comment "!imsd: traffic decapsulated from an imsd security association"
+
+# LAN side (SIP registrar on lan_sip_port, RTP on rtp_port_min..rtp_port_max): nothing to open here.
+# The imsd sockets are bound to lan_ifname (br-lan) and the packets arrive from the "lan" firewall zone, which
+# fw4 accepts on input by default (package/network/config/firewall/files/firewall.config: zone lan, option
+# input ACCEPT; only the defaults and the wan zone have input REJECT). Verified against the defaults of this
+# tree; a router whose lan zone was tightened by hand has to allow UDP 5060 and the RTP range itself.
+# The MMS proxy (TCP mms_proxy_port, default 8090, the LAN address only, bound to lan_ifname) is reached from the same zone and needs
+# nothing either; a lan zone that was tightened by hand has to allow that TCP port as well.
+# Nothing is opened for the other zones (wan, the IMS netdev). Note for the call-control module: the carrier
+# RTP leg lives on the IMS netdev (in no zone); the carrier's packets are only let in as conntrack replies to
+# our own outgoing RTP (ct state established), an unsolicited first packet would be rejected by the input
+# policy. imsd sends first (hole punching) or a rule has to be added when that module lands.
+
+# The on-demand MMS bearer (operators with an MMS APN: SK Telecom ...) has its own guard, not part of fw4: imsd creates and deletes
+# an nftables table "inet imsd_mms" itself (hooks output and forward, priority -10) while that bearer exists; fw4 reloads do not touch it. It
+# lets only DNS to the bearer's servers and TCP to the MMS proxy / MMSC leave through the bearer's netdev and drops the rest, including
+# all forwarding. Nothing is configured here. A table left behind by a crash keeps dropping until imsd runs again (or: nft delete table inet imsd_mms).

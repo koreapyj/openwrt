@@ -1,0 +1,36 @@
+Host tests of imsd
+==================
+
+Run (from the package, no OpenWrt tree needed):
+
+    make -C src test                 all suites, one combined summary
+    make -C src test-asan            the same under ASan + UBSan
+    make -C src test-tsan            threaded suites (store, media) under ThreadSanitizer
+    make -C src test SUITES="test_store test_sdp"      only some suites
+    make -C src bench                media bridge CPU cost (needs IMSD_TEST_CAPDIR)
+    make -C src cross-check          compile everything with the OpenWrt toolchain
+
+Variables
+    TESTOUT           output directory, default src/.testout (ignored by git)
+    HOSTINST          optional prefix holding include/ and lib/ of opencore-amr,
+                      vo-amrwbenc and opus; default empty = the system's libraries
+                      (found through pkg-config, else the compiler's default paths)
+    IMSD_WITH_OPUS    1|0, default: 1 if a host libopus is found, else 0
+    IMSD_TEST_CAPDIR  directory with RTP recordings of a live line (media/b2b tests,
+                      bench). They contain voice audio and are NOT part of the tree.
+                      Expected below it: l1/mt/rtp_rx.bin n1/rtp_rx.bin c1/rtp_rx.bin
+                      run1/rtp_rx.bin
+    TOPDIR, STAGING_DIR, XCC, XINC
+                      only for cross-check / lan-demo: the OpenWrt tree the package sits
+                      in (default four levels up) and its staging_dir; cross-check exits
+                      non-zero if the toolchain is not built there. "make test" never
+                      needs them.
+
+What is skipped (printed, never a failure)
+    - no host opencore-amrnb / opencore-amrwb / vo-amrwbenc: suites test_media,
+      test_cs and test_b2b (they link the codecs); the TSan run drops test_media
+    - no host libopus (or IMSD_WITH_OPUS=0): the media suite runs without the Opus
+      wrapper, test_b2b is skipped (it negotiates and plays Opus)
+    - IMSD_TEST_CAPDIR unset or file missing: the checks that decode or replay a
+      recording (media amr/bridge captures, three b2b audio replays); each prints a
+      "SKIP" line and the runner reports the count

@@ -1,0 +1,16 @@
+imsd: AP side IMS stack daemon
+SPDX-License-Identifier: GPL-2.0-or-later (all of src/ except as noted below)
+
+Vendored third-party code
+-------------------------
+src/media/g722/ (g722_encode.c, g722_decode.c, g722_enc_dec.h): the G.722 encoder / decoder
+from WebRTC modules/third_party/g722, verbatim. Upstream algorithm: Steve Underwood's spandsp
+(2005, explicit public-domain dedication), itself based on the CMU 1993 single-channel 64 kbps
+G.722 code (Copyright (c) CMU 1993, Chengxiang Lu and Alex Hauptmann; the original terms are not
+stated in the files). See src/media/g722/LICENSE (verbatim) and PROVENANCE.txt (origin, hashes,
+licence assessment). Treated as public domain, compatible with GPL-2.0-or-later.
+It is built only when the package option IMSD_WITH_G722 is set (default y); with the option off
+no part of it is compiled or shipped (make IMSD_WITH_G722=0).
+
+Linked libraries (runtime packages, not vendored): libopus (BSD-3-Clause), opencore-amr
+(Apache-2.0), vo-amrwbenc (Apache-2.0), libubox / libubus / libuci / libmnl.

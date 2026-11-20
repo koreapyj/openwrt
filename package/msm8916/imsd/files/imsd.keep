@@ -1,0 +1,3 @@
+# imsd: the message store and the saved LAN registrations (uci store_dir / lan_persist, default /srv/imsd) survive sysupgrade.
+# A store_dir set to another path in /etc/config/imsd has to be added here by hand.
+/srv/imsd
