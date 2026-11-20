@@ -218,6 +218,15 @@ generate_network() {
 				set network.$1.pdptype='ipv4'
 			EOF
 		;;
+
+		modemmanager)
+			# modem is the only uplink: also add a plain (non source-specific)
+			# IPv6 default route so router-originated traffic works on v6-only bearers
+			uci -q batch <<-EOF
+				set network.$1.proto='modemmanager'
+				set network.$1.sourcefilter='0'
+			EOF
+		;;
 	esac
 }
 
