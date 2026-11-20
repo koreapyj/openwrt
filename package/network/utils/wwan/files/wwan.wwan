@@ -1,0 +1,31 @@
+#!/bin/sh
+
+[ "$ACTION" = add ] || [ "$ACTION" = remove ] || exit 0
+case "$DEVNAME" in
+wwan[0-9]*qmi[0-9]*|wwan[0-9]*mbim[0-9]*) ;;
+*) exit 0 ;;
+esac
+
+. /lib/functions.sh
+. /lib/netifd/netifd-proto.sh
+
+find_wwan_iface() {
+	local cfg="$1"
+
+	local proto device
+	config_get proto "$cfg" proto
+	config_get device "$cfg" device
+
+	[ "$proto" = mbim ] || [ "$proto" = qmi ] || return 0
+	[ "$device" = "/dev/$DEVNAME" ] || return 0
+	if [ "$ACTION" = add ]; then
+		proto_set_available "$cfg" 1
+	fi
+	if [ "$ACTION" = remove ]; then
+		proto_set_available "$cfg" 0
+	fi
+	exit 0
+}
+
+config_load network
+config_foreach find_wwan_iface interface
