@@ -1,0 +1,24 @@
+From: Yoonji Park <koreapyj@dcmys.kr>
+Subject: [PATCH] thermal: qcom: tsens-v0_1: do not mask nvmem errors on 8916
+
+calibrate_8916() tries the per-cell nvmem layout first and then falls back
+to the legacy "calib"/"calib_sel" cells, discarding the first error. When
+the DT only has the per-cell layout, the legacy lookup always fails with
+-ENOENT, which hides the real failure of the first attempt. In particular
+-EPROBE_DEFER (qfprom nvmem provider not registered yet) was turned into a
+permanent probe failure ("calibration failed", -ENOENT).
+
+Only fall back to the legacy cells when the new-style cells are really
+missing (-ENOENT) and propagate every other error, including -EPROBE_DEFER.
+
+--- a/drivers/thermal/qcom/tsens-v0_1.c
++++ b/drivers/thermal/qcom/tsens-v0_1.c
+@@ -92,6 +92,8 @@ static int calibrate_8916(struct tsens_p
+ 	ret = tsens_calibrate_nvmem(priv, 3);
+ 	if (!ret)
+ 		return 0;
++	if (ret != -ENOENT)
++		return ret;
+ 
+ 	qfprom_cdata = (u32 *)qfprom_read(priv->dev, "calib");
+ 	if (IS_ERR(qfprom_cdata))

@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+# Login console on the USB ACM gadget port. ttyGS0 only exists after the
+# usbgadget service has run, too late for procd inittab, so run it as a service.
+
+START=20
+USE_PROCD=1
+
+start_service() {
+	[ -c /dev/ttyGS0 ] || return 0
+
+	procd_open_instance
+	procd_set_param command /bin/sh -c "exec /sbin/askfirst /usr/libexec/login.sh </dev/ttyGS0 >/dev/ttyGS0 2>&1"
+	procd_set_param respawn 3600 1 0
+	procd_close_instance
+}

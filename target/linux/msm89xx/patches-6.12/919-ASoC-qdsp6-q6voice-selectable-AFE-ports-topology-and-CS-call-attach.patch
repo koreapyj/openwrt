@@ -1,0 +1,778 @@
+From: Yoonji Park <koreapyj@dcmys.kr>
+Subject: ASoC: qdsp6: q6voice: selectable AFE ports, topology, CS-call attach
+ and VoLTE path
+
+Replace the hardcoded MI2S ports with a struct q6voice_path_cfg: raw AFE
+port ids (so the RT proxy ports 0x2000/0x2001 can be used), vocproc
+topologies (default or VSS_IVOCPROC_TOPOLOGY_ID_NONE), attach mode
+(MVM attach, CVS passive session + CVS attach, or both) and optional
+START_VOICE. q6voice_start_path()/q6voice_stop_path() start the path
+explicitly and undo every step on failure so a start can be retried.
+Add q6cvs passive session/attach commands, a per-command trace hook
+(q6voice_set_trace) reporting handle and DSP status, zero-initialise the
+command structs (stack garbage was sent in session names).
+
+Add Q6VOICE_PATH_VOLTE (path/session index 2, same as the downstream
+msm-4.x q6voice VOC_PATH_VOLTE_PASSIVE) and let q6mvm/q6cvs join the
+CVD session "default volte voice" created by the modem's IMS audio, the
+same way "default modem voice" is joined for CS calls (downstream
+q6voice.c uses that string for both MVM and CVS passive sessions when
+is_volte_session()).
+
+Signed-off-by: Yoonji Park <koreapyj@dcmys.kr>
+---
+--- a/sound/soc/qcom/qdsp6/q6cvp.c
++++ b/sound/soc/qcom/qdsp6/q6cvp.c
+@@ -92,16 +92,17 @@ struct vss_ivocproc_cmd_create_full_control_session_v2_cmd {
+ } __packed;
+ 
+ struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
+-					     u16 tx_port, u16 rx_port)
++					     u16 tx_port, u16 rx_port,
++					     u32 tx_topology, u32 rx_topology)
+ {
+-	struct vss_ivocproc_cmd_create_full_control_session_v2_cmd cmd;
++	struct vss_ivocproc_cmd_create_full_control_session_v2_cmd cmd = {};
+ 
+ 	cmd.hdr.pkt_size = sizeof(cmd);
+ 	cmd.hdr.opcode = VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2;
+ 
+ 	/* TODO: Implement calibration */
+-	cmd.tx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS;
+-	cmd.rx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT;
++	cmd.tx_topology_id = tx_topology ?: VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS;
++	cmd.rx_topology_id = rx_topology ?: VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT;
+ 
+ 	cmd.direction = VSS_IVOCPROC_DIRECTION_RX_TX;
+ 	cmd.tx_port_id = tx_port;
+@@ -116,7 +117,7 @@ EXPORT_SYMBOL_GPL(q6cvp_session_create);
+ 
+ int q6cvp_enable(struct q6voice_session *cvp, bool state)
+ {
+-	struct apr_pkt cmd;
++	struct apr_pkt cmd = {};
+ 
+ 	cmd.hdr.pkt_size = APR_HDR_SIZE;
+ 	cmd.hdr.opcode = state ? VSS_IVOCPROC_CMD_ENABLE : VSS_IVOCPROC_CMD_DISABLE;
+--- a/sound/soc/qcom/qdsp6/q6cvp.h
++++ b/sound/soc/qcom/qdsp6/q6cvp.h
+@@ -7,7 +7,8 @@
+ struct q6voice_session;
+ 
+ struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
+-					     u16 tx_port, u16 rx_port);
++					     u16 tx_port, u16 rx_port,
++					     u32 tx_topology, u32 rx_topology);
+ int q6cvp_enable(struct q6voice_session *cvp, bool enable);
+ 
+ #endif /*_Q6_CVP_H */
+--- a/sound/soc/qcom/qdsp6/q6cvs.c
++++ b/sound/soc/qcom/qdsp6/q6cvs.c
+@@ -8,6 +8,70 @@
+ #include "q6cvs.h"
+ #include "q6voice-common.h"
+ 
++#define VSS_ISTREAM_CMD_CREATE_PASSIVE_CONTROL_SESSION	0x00011140
++
++struct vss_istream_cmd_create_passive_control_session_cmd {
++	struct apr_hdr hdr;
++
++	/* Name of the session to share with its full controller */
++	char name[20];
++} __packed;
++
++#define VSS_ISTREAM_CMD_ATTACH_VOCPROC			0x000110F8
++#define VSS_ISTREAM_CMD_DETACH_VOCPROC			0x000110F9
++
++/* Attach/detach a vocproc to/from the stream */
++struct vss_istream_cmd_attach_vocproc_cmd {
++	struct apr_hdr hdr;
++
++	/* Handle of the vocproc */
++	u16 handle;
++} __packed;
++
++static const char *q6cvs_session_name(enum q6voice_path_type path)
++{
++	switch (path) {
++	case Q6VOICE_PATH_VOICE:
++		return "default modem voice";
++	case Q6VOICE_PATH_VOLTE:
++		return "default volte voice";
++	default:
++		return NULL;
++	}
++}
++
++/*
++ * Join the stream the modem created for the circuit switched call as passive
++ * controller.
++ */
++struct q6voice_session *q6cvs_session_create(enum q6voice_path_type path)
++{
++	struct vss_istream_cmd_create_passive_control_session_cmd cmd = {};
++	const char *name = q6cvs_session_name(path);
++
++	cmd.hdr.pkt_size = sizeof(cmd);
++	cmd.hdr.opcode = VSS_ISTREAM_CMD_CREATE_PASSIVE_CONTROL_SESSION;
++	if (name)
++		strscpy(cmd.name, name, sizeof(cmd.name));
++
++	return q6voice_session_create(Q6VOICE_SERVICE_CVS, path, &cmd.hdr);
++}
++EXPORT_SYMBOL_GPL(q6cvs_session_create);
++
++int q6cvs_attach(struct q6voice_session *cvs, struct q6voice_session *cvp,
++		 bool state)
++{
++	struct vss_istream_cmd_attach_vocproc_cmd cmd = {};
++
++	cmd.hdr.pkt_size = sizeof(cmd);
++	cmd.hdr.opcode = state ? VSS_ISTREAM_CMD_ATTACH_VOCPROC :
++				 VSS_ISTREAM_CMD_DETACH_VOCPROC;
++	cmd.handle = cvp->handle;
++
++	return q6voice_common_send(cvs, &cmd.hdr);
++}
++EXPORT_SYMBOL_GPL(q6cvs_attach);
++
+ static int q6cvs_probe(struct apr_device *adev)
+ {
+ 	return q6voice_common_probe(adev, Q6VOICE_SERVICE_CVS);
+--- a/sound/soc/qcom/qdsp6/q6cvs.h
++++ b/sound/soc/qcom/qdsp6/q6cvs.h
+@@ -6,4 +6,8 @@
+ 
+ struct q6voice_session;
+ 
++struct q6voice_session *q6cvs_session_create(enum q6voice_path_type path);
++int q6cvs_attach(struct q6voice_session *cvs, struct q6voice_session *cvp,
++		 bool state);
++
+ #endif /*_Q6_CVS_H */
+--- a/sound/soc/qcom/qdsp6/q6mvm.c
++++ b/sound/soc/qcom/qdsp6/q6mvm.c
+@@ -51,6 +51,8 @@ static inline const char *q6mvm_session_name(enum q6voice_path_type path)
+ 	switch (path) {
+ 	case Q6VOICE_PATH_VOICE:
+ 		return "default modem voice";
++	case Q6VOICE_PATH_VOLTE:
++		return "default volte voice";
+ 	default:
+ 		return NULL;
+ 	}
+@@ -58,7 +60,7 @@ static inline const char *q6mvm_session_name(enum q6voice_path_type path)
+ 
+ static int q6mvm_set_dual_control(struct q6voice_session *mvm)
+ {
+-	struct vss_imvm_cmd_set_policy_dual_control_cmd cmd;
++	struct vss_imvm_cmd_set_policy_dual_control_cmd cmd = {};
+ 
+ 	cmd.hdr.pkt_size = sizeof(cmd);
+ 	cmd.hdr.opcode = VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL;
+@@ -70,7 +72,7 @@ static int q6mvm_set_dual_control(struct q6voice_session *mvm)
+ 
+ struct q6voice_session *q6mvm_session_create(enum q6voice_path_type path)
+ {
+-	struct vss_imvm_cmd_create_control_session_cmd cmd;
++	struct vss_imvm_cmd_create_control_session_cmd cmd = {};
+ 	struct q6voice_session *mvm;
+ 	const char *session_name;
+ 	int ret;
+@@ -100,7 +102,7 @@ EXPORT_SYMBOL_GPL(q6mvm_session_create);
+ int q6mvm_attach(struct q6voice_session *mvm, struct q6voice_session *cvp,
+ 		 bool state)
+ {
+-	struct vss_imvm_cmd_attach_vocproc_cmd cmd;
++	struct vss_imvm_cmd_attach_vocproc_cmd cmd = {};
+ 
+ 	cmd.hdr.pkt_size = sizeof(cmd);
+ 	cmd.hdr.opcode = state ? VSS_IMVM_CMD_ATTACH_VOCPROC : VSS_IMVM_CMD_DETACH_VOCPROC;
+@@ -113,7 +115,7 @@ EXPORT_SYMBOL_GPL(q6mvm_attach);
+ 
+ int q6mvm_start(struct q6voice_session *mvm, bool state)
+ {
+-	struct apr_pkt cmd;
++	struct apr_pkt cmd = {};
+ 
+ 	cmd.hdr.pkt_size = APR_HDR_SIZE;
+ 	cmd.hdr.opcode = state ? VSS_IMVM_CMD_START_VOICE : VSS_IMVM_CMD_STOP_VOICE;
+--- a/sound/soc/qcom/qdsp6/q6voice-common.c
++++ b/sound/soc/qcom/qdsp6/q6voice-common.c
+@@ -20,9 +20,38 @@ struct q6voice_service {
+ 	struct q6voice_session *sessions[Q6VOICE_PATH_COUNT];
+ };
+ 
+-/* Protect q6voice_services */
++/* Protect q6voice_services and the trace hook */
+ static DEFINE_SPINLOCK(q6voice_services_lock);
+ static struct q6voice_service *q6voice_services[Q6VOICE_SERVICE_COUNT] = {0};
++static q6voice_trace_fn q6voice_trace;
++static void *q6voice_trace_priv;
++
++void q6voice_set_trace(q6voice_trace_fn fn, void *priv)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&q6voice_services_lock, flags);
++	q6voice_trace = fn;
++	q6voice_trace_priv = priv;
++	spin_unlock_irqrestore(&q6voice_services_lock, flags);
++}
++EXPORT_SYMBOL_GPL(q6voice_set_trace);
++
++static void q6voice_trace_cmd(struct q6voice_session *s, u32 opcode, int rc,
++			      u32 status)
++{
++	q6voice_trace_fn fn;
++	void *priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&q6voice_services_lock, flags);
++	fn = q6voice_trace;
++	priv = q6voice_trace_priv;
++	spin_unlock_irqrestore(&q6voice_services_lock, flags);
++
++	if (fn)
++		fn(priv, s->svc->type, opcode, s->handle, rc, status);
++}
+ 
+ int q6voice_common_probe(struct apr_device *adev, enum q6voice_service_type type)
+ {
+@@ -78,7 +107,7 @@ static void q6voice_session_free(struct kref *ref)
+ 
+ static int q6voice_session_destroy(struct q6voice_session *s)
+ {
+-	struct apr_pkt cmd;
++	struct apr_pkt cmd = {};
+ 
+ 	cmd.hdr.pkt_size = APR_HDR_SIZE;
+ 	cmd.hdr.opcode = APRV2_IBASIC_CMD_DESTROY_SESSION;
+@@ -233,6 +262,8 @@ EXPORT_SYMBOL_GPL(q6voice_common_callback);
+ int q6voice_common_send(struct q6voice_session *s, struct apr_hdr *hdr)
+ {
+ 	unsigned long flags;
++	u32 opcode = hdr->opcode;
++	u32 status;
+ 	int ret;
+ 
+ 	hdr->hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+@@ -242,27 +273,36 @@ int q6voice_common_send(struct q6voice_session *s, struct apr_hdr *hdr)
+ 	hdr->token = 0;
+ 
+ 	spin_lock_irqsave(&s->lock, flags);
+-	s->expected_opcode = hdr->opcode;
+-	s->result = 0;
++	s->expected_opcode = opcode;
++	s->result = Q6VOICE_STATUS_NO_RESPONSE;
+ 	spin_unlock_irqrestore(&s->lock, flags);
+ 
+ 	ret = apr_send_pkt(s->svc->adev, (struct apr_pkt *)hdr);
+-	if (ret < 0)
++	if (ret < 0) {
++		q6voice_trace_cmd(s, opcode, ret, Q6VOICE_STATUS_NO_RESPONSE);
+ 		return ret;
++	}
+ 
+ 	ret = wait_event_timeout(s->wait, (s->expected_opcode == 0),
+ 				 msecs_to_jiffies(TIMEOUT_MS));
+ 	if (!ret) {
++		spin_lock_irqsave(&s->lock, flags);
+ 		s->expected_opcode = 0;
++		spin_unlock_irqrestore(&s->lock, flags);
++		q6voice_trace_cmd(s, opcode, -ETIMEDOUT,
++				  Q6VOICE_STATUS_NO_RESPONSE);
+ 		return -ETIMEDOUT;
+ 	}
+ 
+-	if (s->result > 0) {
++	status = s->result;
++	if (status > 0) {
+ 		dev_err(s->dev, "command %#x failed with error %d\n",
+-			hdr->opcode, s->result);
++			opcode, status);
++		q6voice_trace_cmd(s, opcode, -EIO, status);
+ 		return -EIO;
+ 	}
+ 
++	q6voice_trace_cmd(s, opcode, 0, status);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(q6voice_common_send);
+--- a/sound/soc/qcom/qdsp6/q6voice-common.h
++++ b/sound/soc/qcom/qdsp6/q6voice-common.h
+@@ -14,6 +14,9 @@ enum q6voice_service_type {
+ 
+ struct q6voice_service;
+ 
++/* Result reported for a command that got no response at all */
++#define Q6VOICE_STATUS_NO_RESPONSE	0xffffffff
++
+ struct q6voice_session {
+ 	struct device *dev;
+ 	struct q6voice_service *svc;
+@@ -30,6 +33,21 @@ struct q6voice_session {
+ 	u32 result;
+ };
+ 
++/**
++ * q6voice_trace_fn - called after every command sent with
++ * q6voice_common_send(), also for failed ones.
++ *
++ * @rc: 0, -ETIMEDOUT, -EIO (DSP status != 0) or a transmit error
++ * @status: status code of the DSP response (Q6VOICE_STATUS_NO_RESPONSE if
++ *	there was none)
++ * @handle: session handle (0 while the session is being created)
++ *
++ * The callback runs in the context of the caller and may sleep.
++ */
++typedef void (*q6voice_trace_fn)(void *priv, enum q6voice_service_type svc,
++				 u32 opcode, u16 handle, int rc, u32 status);
++void q6voice_set_trace(q6voice_trace_fn fn, void *priv);
++
+ int q6voice_common_probe(struct apr_device *adev, enum q6voice_service_type type);
+ void q6voice_common_remove(struct apr_device *adev);
+ 
+--- a/sound/soc/qcom/qdsp6/q6voice.c
++++ b/sound/soc/qcom/qdsp6/q6voice.c
+@@ -16,13 +16,20 @@
+ struct q6voice_path_runtime {
+ 	struct q6voice_session *sessions[Q6VOICE_SERVICE_COUNT];
+ 	unsigned int started;
++
++	/* what has been done on the DSP, so that failures can be unwound */
++	bool cvp_enabled;
++	bool attached_mvm;
++	bool attached_cvs;
++	bool voice_started;
+ };
+ 
+ struct q6voice_path {
+ 	struct q6voice *v;
+ 
+ 	enum q6voice_path_type type;
+-	int tx_port, rx_port;
++	int tx_port, rx_port;	/* port indices (DT ids), see q6voice_set_port() */
++	struct q6voice_path_cfg cfg;
+ 	/* Serialize access to voice path session */
+ 	struct mutex lock;
+ 	struct q6voice_path_runtime *runtime;
+@@ -33,58 +40,171 @@ struct q6voice {
+ 	struct q6voice_path paths[Q6VOICE_PATH_COUNT];
+ };
+ 
++void q6voice_path_cfg_default(struct q6voice_path_cfg *cfg)
++{
++	cfg->rx_afe_port = Q6VOICE_PORT_AUTO;
++	cfg->tx_afe_port = Q6VOICE_PORT_AUTO;
++	cfg->rx_topology = Q6VOICE_TOPOLOGY_DEFAULT;
++	cfg->tx_topology = Q6VOICE_TOPOLOGY_DEFAULT;
++	cfg->attach = Q6VOICE_ATTACH_MVM;
++	cfg->start_voice = true;
++}
++EXPORT_SYMBOL_GPL(q6voice_path_cfg_default);
++
++static int q6voice_resolve_port(int afe_port, int index)
++{
++	if (afe_port == Q6VOICE_PORT_AUTO)
++		afe_port = q6afe_get_port_id(index);
++	if (afe_port <= 0 || afe_port >= 0xffff)
++		return -EINVAL;
++	return afe_port;
++}
++
++static void q6voice_path_unwind(struct q6voice_path *p)
++{
++	struct q6voice_path_runtime *rt = p->runtime;
++	struct device *dev = p->v->dev;
++	struct q6voice_session *mvm = rt->sessions[Q6VOICE_SERVICE_MVM];
++	struct q6voice_session *cvs = rt->sessions[Q6VOICE_SERVICE_CVS];
++	struct q6voice_session *cvp = rt->sessions[Q6VOICE_SERVICE_CVP];
++	int ret;
++
++	if (rt->voice_started) {
++		ret = q6mvm_start(mvm, false);
++		if (ret)
++			dev_err(dev, "failed to stop voice: %d\n", ret);
++		rt->voice_started = false;
++	}
++
++	if (rt->attached_cvs) {
++		ret = q6cvs_attach(cvs, cvp, false);
++		if (ret)
++			dev_err(dev, "failed to detach cvp from cvs: %d\n", ret);
++		rt->attached_cvs = false;
++	}
++
++	if (rt->attached_mvm) {
++		ret = q6mvm_attach(mvm, cvp, false);
++		if (ret)
++			dev_err(dev, "failed to detach cvp from mvm: %d\n", ret);
++		rt->attached_mvm = false;
++	}
++
++	if (rt->cvp_enabled) {
++		ret = q6cvp_enable(cvp, false);
++		if (ret)
++			dev_err(dev, "failed to disable cvp: %d\n", ret);
++		rt->cvp_enabled = false;
++	}
++}
++
++static void q6voice_path_release_sessions(struct q6voice_path *p)
++{
++	struct q6voice_path_runtime *rt = p->runtime;
++	enum q6voice_service_type svc;
++
++	/* destroy the vocproc first, the passive sessions last */
++	if (rt->sessions[Q6VOICE_SERVICE_CVP]) {
++		q6voice_session_release(rt->sessions[Q6VOICE_SERVICE_CVP]);
++		rt->sessions[Q6VOICE_SERVICE_CVP] = NULL;
++	}
++	for (svc = 0; svc < Q6VOICE_SERVICE_COUNT; ++svc) {
++		if (rt->sessions[svc]) {
++			q6voice_session_release(rt->sessions[svc]);
++			rt->sessions[svc] = NULL;
++		}
++	}
++}
++
++/*
++ * Bring up the call path on the DSP. On failure everything that was done is
++ * undone again, including the sessions, so that the start can be retried with
++ * a different configuration.
++ */
+ static int q6voice_path_start(struct q6voice_path *p)
+ {
++	struct q6voice_path_runtime *rt = p->runtime;
++	const struct q6voice_path_cfg *cfg = &p->cfg;
+ 	struct device *dev = p->v->dev;
+-	struct q6voice_session *mvm, *cvp;
++	struct q6voice_session *mvm, *cvs = NULL, *cvp;
++	bool use_mvm_attach = cfg->attach != Q6VOICE_ATTACH_CVS;
++	bool use_cvs = cfg->attach != Q6VOICE_ATTACH_MVM;
++	int tx_port, rx_port;
+ 	int ret;
+ 
+ 	dev_dbg(dev, "start path %d\n", p->type);
+ 
+-	mvm = p->runtime->sessions[Q6VOICE_SERVICE_MVM];
+-	if (!mvm) {
+-		mvm = q6mvm_session_create(p->type);
+-		if (IS_ERR(mvm))
+-			return PTR_ERR(mvm);
+-		p->runtime->sessions[Q6VOICE_SERVICE_MVM] = mvm;
++	tx_port = q6voice_resolve_port(cfg->tx_afe_port, p->tx_port);
++	rx_port = q6voice_resolve_port(cfg->rx_afe_port, p->rx_port);
++	if (tx_port < 0 || rx_port < 0) {
++		dev_err(dev, "no valid rx/tx AFE port selected (rx %d, tx %d)\n",
++			cfg->rx_afe_port, cfg->tx_afe_port);
++		return -EINVAL;
++	}
++	dev_dbg(dev, "AFE ports: rx %#x tx %#x, topology rx %#x tx %#x\n",
++		rx_port, tx_port, cfg->rx_topology, cfg->tx_topology);
++
++	mvm = q6mvm_session_create(p->type);
++	if (IS_ERR(mvm))
++		return PTR_ERR(mvm);
++	rt->sessions[Q6VOICE_SERVICE_MVM] = mvm;
++
++	if (use_cvs) {
++		cvs = q6cvs_session_create(p->type);
++		if (IS_ERR(cvs)) {
++			ret = PTR_ERR(cvs);
++			goto err;
++		}
++		rt->sessions[Q6VOICE_SERVICE_CVS] = cvs;
+ 	}
+ 
+-	cvp = p->runtime->sessions[Q6VOICE_SERVICE_CVP];
+-	if (!cvp) {
+-		cvp = q6cvp_session_create(p->type,
+-					   q6afe_get_port_id(p->tx_port),
+-					   q6afe_get_port_id(p->rx_port));
+-		if (IS_ERR(cvp))
+-			return PTR_ERR(cvp);
+-		p->runtime->sessions[Q6VOICE_SERVICE_CVP] = cvp;
++	cvp = q6cvp_session_create(p->type, tx_port, rx_port,
++				   cfg->tx_topology, cfg->rx_topology);
++	if (IS_ERR(cvp)) {
++		ret = PTR_ERR(cvp);
++		goto err;
+ 	}
++	rt->sessions[Q6VOICE_SERVICE_CVP] = cvp;
+ 
+ 	ret = q6cvp_enable(cvp, true);
+ 	if (ret) {
+ 		dev_err(dev, "failed to enable cvp: %d\n", ret);
+-		goto cvp_err;
++		goto err;
+ 	}
++	rt->cvp_enabled = true;
+ 
+-	ret = q6mvm_attach(mvm, cvp, true);
+-	if (ret) {
+-		dev_err(dev, "failed to attach cvp to mvm: %d\n", ret);
+-		goto attach_err;
++	if (use_mvm_attach) {
++		ret = q6mvm_attach(mvm, cvp, true);
++		if (ret) {
++			dev_err(dev, "failed to attach cvp to mvm: %d\n", ret);
++			goto err;
++		}
++		rt->attached_mvm = true;
+ 	}
+ 
+-	ret = q6mvm_start(mvm, true);
+-	if (ret) {
+-		dev_err(dev, "failed to start voice: %d\n", ret);
+-		goto start_err;
++	if (use_cvs) {
++		ret = q6cvs_attach(cvs, cvp, true);
++		if (ret) {
++			dev_err(dev, "failed to attach cvp to cvs: %d\n", ret);
++			goto err;
++		}
++		rt->attached_cvs = true;
+ 	}
+ 
+-	return ret;
++	if (cfg->start_voice) {
++		ret = q6mvm_start(mvm, true);
++		if (ret) {
++			dev_err(dev, "failed to start voice: %d\n", ret);
++			goto err;
++		}
++		rt->voice_started = true;
++	}
++
++	return 0;
+ 
+-start_err:
+-	q6mvm_start(mvm, false);
+-attach_err:
+-	q6mvm_attach(mvm, cvp, false);
+-cvp_err:
+-	q6cvp_enable(cvp, false);
++err:
++	q6voice_path_unwind(p);
++	q6voice_path_release_sessions(p);
+ 	return ret;
+ }
+ 
+@@ -95,7 +215,7 @@ int q6voice_start(struct q6voice *v, enum q6voice_path_type path, bool capture)
+ 
+ 	mutex_lock(&p->lock);
+ 	if (!p->runtime) {
+-		p->runtime = kzalloc(sizeof(*p), GFP_KERNEL);
++		p->runtime = kzalloc(sizeof(*p->runtime), GFP_KERNEL);
+ 		if (!p->runtime) {
+ 			ret = -ENOMEM;
+ 			goto out;
+@@ -128,35 +248,18 @@ EXPORT_SYMBOL_GPL(q6voice_start);
+ 
+ static void q6voice_path_stop(struct q6voice_path *p)
+ {
+-	struct device *dev = p->v->dev;
+-	struct q6voice_session *mvm = p->runtime->sessions[Q6VOICE_SERVICE_MVM];
+-	struct q6voice_session *cvp = p->runtime->sessions[Q6VOICE_SERVICE_CVP];
+-	int ret;
+-
+-	dev_dbg(dev, "stop path %d\n", p->type);
+-
+-	ret = q6mvm_start(mvm, false);
+-	if (ret)
+-		dev_err(dev, "failed to stop voice: %d\n", ret);
+-
+-	ret = q6mvm_attach(mvm, cvp, false);
+-	if (ret)
+-		dev_err(dev, "failed to detach cvp from mvm: %d\n", ret);
++	dev_dbg(p->v->dev, "stop path %d\n", p->type);
+ 
+-	ret = q6cvp_enable(cvp, false);
+-	if (ret)
+-		dev_err(dev, "failed to disable cvp: %d\n", ret);
++	q6voice_path_unwind(p);
++	/* the sessions are created again by the next start */
++	q6voice_path_release_sessions(p);
+ }
+ 
+ static void q6voice_path_destroy(struct q6voice_path *p)
+ {
+ 	struct q6voice_path_runtime *runtime = p->runtime;
+-	enum q6voice_service_type svc;
+ 
+-	for (svc = 0; svc < Q6VOICE_SERVICE_COUNT; ++svc) {
+-		if (runtime->sessions[svc])
+-			q6voice_session_release(runtime->sessions[svc]);
+-	}
++	q6voice_path_release_sessions(p);
+ 
+ 	p->runtime = NULL;
+ 	kfree(runtime);
+@@ -185,6 +288,87 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(q6voice_stop);
+ 
++/**
++ * q6voice_start_path() - start a voice path with an explicit configuration
++ *
++ * @v: voice instance
++ * @path: voice path
++ * @cfg: AFE ports, topologies and call flow variant to use. The ports are
++ *	raw AFE port ids, so that ports without a DAI (e.g. the RT proxy
++ *	ports 0x2000/0x2001) can be used. The AFE ports must already be
++ *	started by the caller.
++ *
++ * Unlike the DAI path (q6voice_start()) this does not wait for both
++ * directions: the path is started immediately and marked as running for both,
++ * until q6voice_stop_path() is called. On failure nothing is left behind on
++ * the DSP, so the call can be retried with another configuration.
++ */
++int q6voice_start_path(struct q6voice *v, enum q6voice_path_type path,
++		       const struct q6voice_path_cfg *cfg)
++{
++	struct q6voice_path *p = &v->paths[path];
++	struct q6voice_path_cfg saved;
++	int ret;
++
++	mutex_lock(&p->lock);
++	if (p->runtime) {
++		ret = -EBUSY;
++		goto out;
++	}
++	p->runtime = kzalloc(sizeof(*p->runtime), GFP_KERNEL);
++	if (!p->runtime) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	saved = p->cfg;
++	p->cfg = *cfg;
++	ret = q6voice_path_start(p);
++	p->cfg = saved;
++	if (ret) {
++		q6voice_path_destroy(p);
++		goto out;
++	}
++	p->runtime->started = 3;
++out:
++	mutex_unlock(&p->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6voice_start_path);
++
++int q6voice_stop_path(struct q6voice *v, enum q6voice_path_type path)
++{
++	struct q6voice_path *p = &v->paths[path];
++	int ret = 0;
++
++	mutex_lock(&p->lock);
++	if (!p->runtime) {
++		ret = -ENODEV;
++		goto out;
++	}
++	if (p->runtime->started == 3)
++		q6voice_path_stop(p);
++	q6voice_path_destroy(p);
++out:
++	mutex_unlock(&p->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6voice_stop_path);
++
++/**
++ * q6voice_set_path_cfg() - set the configuration used by the DAI path
++ */
++void q6voice_set_path_cfg(struct q6voice *v, enum q6voice_path_type path,
++			  const struct q6voice_path_cfg *cfg)
++{
++	struct q6voice_path *p = &v->paths[path];
++
++	mutex_lock(&p->lock);
++	p->cfg = *cfg;
++	mutex_unlock(&p->lock);
++}
++EXPORT_SYMBOL_GPL(q6voice_set_path_cfg);
++
+ static void q6voice_free(void *data)
+ {
+ 	struct q6voice *v = data;
+@@ -226,6 +410,7 @@ struct q6voice *q6voice_create(struct device *dev)
+ 		p->v = v;
+ 		p->type = path;
+ 		mutex_init(&p->lock);
++		q6voice_path_cfg_default(&p->cfg);
+ 	}
+ 
+ 	ret = devm_add_action(dev, q6voice_free, v);
+--- a/sound/soc/qcom/qdsp6/q6voice.h
++++ b/sound/soc/qcom/qdsp6/q6voice.h
+@@ -2,10 +2,14 @@
+ #ifndef _Q6_VOICE_H
+ #define _Q6_VOICE_H
+ 
++#include <linux/types.h>
++
++struct device;
++
+ enum q6voice_path_type {
+ 	Q6VOICE_PATH_VOICE	= 0,
+ 	/* TODO: Q6VOICE_PATH_VOIP	= 1, */
+-	/* TODO: Q6VOICE_PATH_VOLTE	= 2, */
++	Q6VOICE_PATH_VOLTE	= 2,
+ 	/* TODO: Q6VOICE_PATH_VOICE2	= 3, */
+ 	/* TODO: Q6VOICE_PATH_QCHAT	= 4, */
+ 	/* TODO: Q6VOICE_PATH_VOWLAN	= 5, */
+@@ -16,6 +20,51 @@ enum q6voice_path_type {
+ 
+ struct q6voice;
+ 
++/* use the port selected with q6voice_set_port() (DAI path) */
++#define Q6VOICE_PORT_AUTO		(-1)
++
++/* topology 0: use the built-in default (TX_SM_ECNS 0x10F71, RX_DEFAULT 0x10F77) */
++#define Q6VOICE_TOPOLOGY_DEFAULT	0
++/* VSS_IVOCPROC_TOPOLOGY_ID_NONE: pass-through, no processing */
++#define Q6VOICE_TOPOLOGY_NONE		0x00010F70
++
++/* How the vocproc is connected to the modem's stream */
++enum q6voice_attach_mode {
++	/* MVM_ATTACH_VOCPROC (0x1123E) only; CVD >= 2.x */
++	Q6VOICE_ATTACH_MVM,
++	/* join the modem's CVS as passive controller + CVS_ATTACH_VOCPROC (0x110F8) */
++	Q6VOICE_ATTACH_CVS,
++	/* both of the above */
++	Q6VOICE_ATTACH_BOTH,
++};
++
++/**
++ * struct q6voice_path_cfg - configuration of a voice path
++ *
++ * @rx_afe_port: AFE (DSP) port id for the downlink, e.g. 0x1000 (PRIMARY_MI2S_RX)
++ *	or 0x2000 (RT proxy RX), or Q6VOICE_PORT_AUTO
++ * @tx_afe_port: AFE (DSP) port id for the uplink, e.g. 0x1005 or 0x2001
++ * @rx_topology: vocproc RX topology id, Q6VOICE_TOPOLOGY_DEFAULT/_NONE/raw id
++ * @tx_topology: vocproc TX topology id
++ * @attach: see &enum q6voice_attach_mode
++ * @start_voice: send MVM START_VOICE after attaching
++ */
++struct q6voice_path_cfg {
++	int rx_afe_port;
++	int tx_afe_port;
++	u32 rx_topology;
++	u32 tx_topology;
++	enum q6voice_attach_mode attach;
++	bool start_voice;
++};
++
++void q6voice_path_cfg_default(struct q6voice_path_cfg *cfg);
++int q6voice_start_path(struct q6voice *v, enum q6voice_path_type path,
++		       const struct q6voice_path_cfg *cfg);
++int q6voice_stop_path(struct q6voice *v, enum q6voice_path_type path);
++void q6voice_set_path_cfg(struct q6voice *v, enum q6voice_path_type path,
++			  const struct q6voice_path_cfg *cfg);
++
+ struct q6voice *q6voice_create(struct device *dev);
+ int q6voice_start(struct q6voice *v, enum q6voice_path_type path, bool capture);
+ int q6voice_stop(struct q6voice *v, enum q6voice_path_type path, bool capture);

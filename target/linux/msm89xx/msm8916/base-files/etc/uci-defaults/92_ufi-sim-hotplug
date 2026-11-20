@@ -1,0 +1,10 @@
+#!/bin/sh
+. /lib/functions.sh
+
+case "$(board_name)" in
+generic,ufi-esim)
+	/etc/init.d/ufi-sim-hotplug enable
+	;;
+esac
+
+exit 0

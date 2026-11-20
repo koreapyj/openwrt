@@ -1,0 +1,504 @@
+From: Yoonji Park <koreapyj@dcmys.kr>
+Subject: [PATCH] net: wwan: qcom_bam_dmux: recover from modem restarts
+
+The driver has no notion of the modem restarting. If the modem crashes
+(or is restarted) while BAM-DMUX is set up, the "pc" edges seen by the
+driver can get out of sync: the SMSM interrupt controller drops a 1->0->1
+transition that happens between two interrupts and the driver toggled
+its cached pc_state on every interrupt instead of reading the line.
+The stale TX/RX DMA channels, pending TX buffers (and their runtime PM
+references) and the power vote were kept, so the TX slots never got free
+again and the next power up of the modem was never handled.
+
+Fix this by
+ - reading the real level of the "pc" line instead of toggling,
+ - listening to the SSR notifier of the modem ("mpss"). The BAM is powered
+   remotely, so it may only be accessed while the modem is powered. Tear
+   everything down (DMA channels, pending TX buffers and their runtime PM
+   references, power vote, remote channels, network interfaces) before
+   shutdown, when the BAM is still powered, as is done on a regular falling
+   edge of "pc". Do not touch the BAM again until the restarted modem
+   raises "pc" and the regular power on path runs,
+ - re-reading the pc line after power up of the modem and when waking up
+   from runtime suspend, so that a missed edge cannot block the power up,
+ - resetting the "pc" and "pc-ack" bits of the modem in SMSM once the
+   modem is off, as the downstream SMSM driver resets the whole entry of a
+   restarted processor. Otherwise a bit that was set before the restart
+   stays set and the restarted modem setting it again causes no edge:
+   powering on the BAM right after the restart, before the restarted modem
+   has set it up, hangs the bus, and the first ack of the restarted modem
+   is missed, so the next power up times out. smsm gets an
+   irq_set_irqchip_state() callback for this,
+ - opening a channel again when the restarted modem opens it while its
+   network interface is still up. The restarted modem does not know that
+   the channel was opened before and sends no data on it otherwise.
+
+--- a/drivers/net/wwan/qcom_bam_dmux.c
++++ b/drivers/net/wwan/qcom_bam_dmux.c
+@@ -13,9 +13,11 @@
+ #include <linux/interrupt.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/remoteproc/qcom_rproc.h>
+ #include <linux/soc/qcom/smem_state.h>
+ #include <linux/spinlock.h>
+ #include <linux/wait.h>
+@@ -31,6 +33,7 @@
+ 
+ #define BAM_DMUX_AUTOSUSPEND_DELAY	1000
+ #define BAM_DMUX_REMOTE_TIMEOUT		msecs_to_jiffies(2000)
++#define BAM_DMUX_SSR_NAME		"mpss"
+ 
+ enum {
+ 	BAM_DMUX_CMD_DATA,
+@@ -68,8 +71,13 @@
+ struct bam_dmux {
+ 	struct device *dev;
+ 
+-	int pc_irq;
++	int pc_irq, pc_ack_irq;
+ 	bool pc_state, pc_ack_state;
++	struct mutex pc_lock; /* Serialize pc_state changes and DMA setup/teardown */
++	/* The modem is down: its BAM is unpowered and must not be accessed */
++	bool modem_down;
++	struct notifier_block ssr_nb;
++	void *ssr_cookie;
+ 	struct qcom_smem_state *pc, *pc_ack;
+ 	u32 pc_mask, pc_ack_mask;
+ 	wait_queue_head_t pc_wait;
+@@ -85,6 +93,9 @@
+ 
+ 	DECLARE_BITMAP(remote_channels, BAM_DMUX_NUM_CH);
+ 	struct work_struct register_netdev_work;
++	/* Channels that are open locally and must be opened again remotely */
++	DECLARE_BITMAP(reopen_channels, BAM_DMUX_NUM_CH);
++	struct work_struct reopen_work;
+ 	struct net_device *netdevs[BAM_DMUX_NUM_CH];
+ };
+ 
+@@ -189,6 +200,9 @@
+ 	struct bam_dmux *dmux = skb_dma->dmux;
+ 	struct dma_async_tx_descriptor *desc;
+ 
++	if (READ_ONCE(dmux->modem_down))
++		return false;
++
+ 	desc = dmaengine_prep_slave_single(dmux->tx, skb_dma->addr,
+ 					   skb_dma->skb->len, DMA_MEM_TO_DEV,
+ 					   DMA_PREP_INTERRUPT);
+@@ -470,6 +484,33 @@
+ 	}
+ }
+ 
++/*
++ * The remote side opened a channel whose network interface is already up,
++ * e.g. after a restart of the modem. The restarted modem does not know that
++ * we opened the channel, so tell it again, as is done when the interface is
++ * brought up. Otherwise it does not send any data on the channel.
++ */
++static void bam_dmux_reopen_work(struct work_struct *work)
++{
++	struct bam_dmux *dmux = container_of(work, struct bam_dmux, reopen_work);
++	struct net_device *netdev;
++	int ch, ret;
++
++	rtnl_lock();
++	for (ch = 0; ch < BAM_DMUX_NUM_CH; ch++) {
++		if (!test_and_clear_bit(ch, dmux->reopen_channels))
++			continue;
++
++		netdev = dmux->netdevs[ch];
++		if (!netdev || !netif_running(netdev))
++			continue;
++
++		ret = bam_dmux_send_cmd(netdev_priv(netdev), BAM_DMUX_CMD_OPEN);
++		dev_info(dmux->dev, "reopen channel %d: %d\n", ch, ret);
++	}
++	rtnl_unlock();
++}
++
+ static void bam_dmux_rx_callback(void *data);
+ 
+ static bool bam_dmux_skb_dma_submit_rx(struct bam_dmux_skb_dma *skb_dma)
+@@ -560,6 +601,11 @@
+ 
+ 	if (netdev) {
+ 		netif_device_attach(netdev);
++		if (netif_running(netdev)) {
++			/* Cannot sleep here, schedule work to send the open */
++			set_bit(hdr->ch, dmux->reopen_channels);
++			schedule_work(&dmux->reopen_work);
++		}
+ 	} else {
+ 		/* Cannot sleep here, schedule work to register the netdev */
+ 		schedule_work(&dmux->register_netdev_work);
+@@ -681,12 +727,33 @@
+ 	bam_dmux_free_skbs(dmux->rx_skbs, DMA_FROM_DEVICE);
+ }
+ 
+-static irqreturn_t bam_dmux_pc_irq(int irq, void *data)
++/*
++ * Sync with the current state of the "pc" line of the remote side. The line
++ * level is used instead of toggling the previous state, since edges can get
++ * lost (e.g. when the modem restarts) and we must not get out of sync then.
++ */
++static void bam_dmux_pc_update(struct bam_dmux *dmux)
+ {
+-	struct bam_dmux *dmux = data;
+-	bool new_state = !dmux->pc_state;
++	bool new_state;
++	int ret;
++
++	mutex_lock(&dmux->pc_lock);
+ 
+-	dev_dbg(dmux->dev, "pc: %u\n", new_state);
++	ret = irq_get_irqchip_state(dmux->pc_irq, IRQCHIP_STATE_LINE_LEVEL,
++				    &new_state);
++	if (ret) {
++		dev_err(dmux->dev, "Failed to get pc line level: %d\n", ret);
++		goto out;
++	}
++
++	/* The line is stale while the modem is down, the BAM is unpowered */
++	if (dmux->modem_down)
++		goto out;
++
++	if (new_state == dmux->pc_state)
++		goto out;
++
++	dev_info(dmux->dev, "pc: %s\n", new_state ? "on" : "off");
+ 
+ 	if (new_state) {
+ 		if (bam_dmux_power_on(dmux))
+@@ -701,6 +768,13 @@
+ 	dmux->pc_state = new_state;
+ 	wake_up_all(&dmux->pc_wait);
+ 
++out:
++	mutex_unlock(&dmux->pc_lock);
++}
++
++static irqreturn_t bam_dmux_pc_irq(int irq, void *data)
++{
++	bam_dmux_pc_update(data);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -714,6 +788,135 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++static void bam_dmux_free_pending_tx(struct bam_dmux *dmux)
++{
++	unsigned long flags;
++	int i;
++
++	for (i = 0; i < BAM_DMUX_NUM_SKB; i++) {
++		struct bam_dmux_skb_dma *skb_dma = &dmux->tx_skbs[i];
++		struct sk_buff *skb;
++
++		spin_lock_irqsave(&dmux->tx_lock, flags);
++		skb = skb_dma->skb;
++		skb_dma->skb = NULL;
++		spin_unlock_irqrestore(&dmux->tx_lock, flags);
++		if (!skb)
++			continue;
++
++		/* Every queued skb holds a runtime PM reference */
++		pm_runtime_put_noidle(dmux->dev);
++		if (skb_dma->addr) {
++			dma_unmap_single(dmux->dev, skb_dma->addr, skb->len,
++					 DMA_TO_DEVICE);
++			skb_dma->addr = 0;
++		}
++		dev_kfree_skb_any(skb);
++	}
++
++	spin_lock_irqsave(&dmux->tx_lock, flags);
++	dmux->tx_next_skb = 0;
++	spin_unlock_irqrestore(&dmux->tx_lock, flags);
++	atomic_long_set(&dmux->tx_deferred_skb, 0);
++}
++
++/*
++ * The modem is about to be stopped (crashed or restarted). This runs from the
++ * remoteproc stop path before the modem is powered off, so the BAM is still
++ * powered here, even if the modem software died: tear everything down now,
++ * exactly like on a regular falling edge of the "pc" line. Once the modem is
++ * powered off the BAM must not be touched until the restarted modem raises
++ * "pc" again and bam_dmux_power_on() sets everything up from scratch.
++ */
++static void bam_dmux_modem_going_down(struct bam_dmux *dmux)
++{
++	struct device *dev = dmux->dev;
++	int i;
++
++	dev_info(dev, "modem going down\n");
++
++	/* Waits for BAM accesses that are in progress */
++	mutex_lock(&dmux->pc_lock);
++	dmux->modem_down = true;
++	mutex_unlock(&dmux->pc_lock);
++
++	/* Make runtime resume and pc waiters fail fast */
++	complete_all(&dmux->pc_ack_completion);
++	wake_up_all(&dmux->pc_wait);
++
++	for (i = 0; i < BAM_DMUX_NUM_CH; ++i)
++		if (dmux->netdevs[i])
++			netif_device_detach(dmux->netdevs[i]);
++	synchronize_net();
++	cancel_work_sync(&dmux->tx_wakeup_work);
++	cancel_work_sync(&dmux->reopen_work);
++	bitmap_zero(dmux->reopen_channels, BAM_DMUX_NUM_CH);
++
++	mutex_lock(&dmux->pc_lock);
++	/* Hardware teardown, as on a regular falling edge of "pc" */
++	bam_dmux_power_off(dmux);
++	bam_dmux_free_pending_tx(dmux);
++	if (dmux->pc_state)
++		bam_dmux_pc_ack(dmux);
++	dmux->pc_state = false;
++	bitmap_zero(dmux->remote_channels, BAM_DMUX_NUM_CH);
++	mutex_unlock(&dmux->pc_lock);
++
++	/* Drop our power vote, the remote side lost its state anyway */
++	qcom_smem_state_update_bits(dmux->pc, dmux->pc_mask, 0);
++	complete_all(&dmux->pc_ack_completion);
++
++	/* Start over in suspended state, all TX references are gone */
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++	pm_runtime_enable(dev);
++
++	wake_up_all(&dmux->pc_wait);
++
++	dev_info(dev, "torn down\n");
++}
++
++static int bam_dmux_ssr_notify(struct notifier_block *nb, unsigned long action,
++			       void *data)
++{
++	struct bam_dmux *dmux = container_of(nb, struct bam_dmux, ssr_nb);
++	int ret, ret2;
++
++	switch (action) {
++	case QCOM_SSR_BEFORE_SHUTDOWN:
++		bam_dmux_modem_going_down(dmux);
++		break;
++	case QCOM_SSR_AFTER_SHUTDOWN:
++		/*
++		 * Modem is off: no BAM access. The SMSM state of the modem is
++		 * not reset on restart, so a "pc" or "pc-ack" bit that was set
++		 * before would stay set and the restarted modem setting it
++		 * (or toggling "pc-ack" for the first time) would not cause an
++		 * edge. Reset both, as the downstream SMSM driver resets the
++		 * whole entry on restart, so that the restarted modem raising
++		 * "pc" powers us on once it has set up its BAM and its first
++		 * ack of our vote is seen.
++		 */
++		ret = irq_set_irqchip_state(dmux->pc_irq,
++					    IRQCHIP_STATE_LINE_LEVEL, false);
++		ret2 = irq_set_irqchip_state(dmux->pc_ack_irq,
++					     IRQCHIP_STATE_LINE_LEVEL, false);
++		dev_info(dmux->dev, "modem down (pc reset: %d, pc-ack reset: %d)\n",
++			 ret, ret2);
++		break;
++	case QCOM_SSR_AFTER_POWERUP:
++		dev_info(dmux->dev, "modem up\n");
++		mutex_lock(&dmux->pc_lock);
++		dmux->modem_down = false;
++		mutex_unlock(&dmux->pc_lock);
++		/* Catch up with the "pc" line, the edge may have been lost */
++		bam_dmux_pc_update(dmux);
++		break;
++	}
++
++	return NOTIFY_OK;
++}
++
+ static int bam_dmux_runtime_suspend(struct device *dev)
+ {
+ 	struct bam_dmux *dmux = dev_get_drvdata(dev);
+@@ -730,6 +933,9 @@
+ 
+ 	dev_dbg(dev, "runtime resume\n");
+ 
++	if (READ_ONCE(dmux->modem_down))
++		return -EAGAIN;
++
+ 	/* Wait until previous power down was acked */
+ 	if (!wait_for_completion_timeout(&dmux->pc_ack_completion,
+ 					 BAM_DMUX_REMOTE_TIMEOUT))
+@@ -744,13 +950,23 @@
+ 		bam_dmux_pc_vote(dmux, false);
+ 		return -ETIMEDOUT;
+ 	}
++	if (READ_ONCE(dmux->modem_down)) {
++		bam_dmux_pc_vote(dmux, false);
++		return -EAGAIN;
++	}
+ 
+-	/* Wait until we're up */
+-	if (!wait_event_timeout(dmux->pc_wait, dmux->pc_state,
++	/* Wait until we're up (re-check the line in case an edge was missed) */
++	bam_dmux_pc_update(dmux);
++	if (!wait_event_timeout(dmux->pc_wait,
++				dmux->pc_state || dmux->modem_down,
+ 				BAM_DMUX_REMOTE_TIMEOUT)) {
+ 		bam_dmux_pc_vote(dmux, false);
+ 		return -ETIMEDOUT;
+ 	}
++	if (READ_ONCE(dmux->modem_down)) {
++		bam_dmux_pc_vote(dmux, false);
++		return -EAGAIN;
++	}
+ 
+ 	/* Ensure that we actually initialized successfully */
+ 	if (!dmux->rx) {
+@@ -777,7 +993,7 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct bam_dmux *dmux;
+-	int ret, pc_ack_irq, i;
++	int ret, i;
+ 	unsigned int bit;
+ 
+ 	dmux = devm_kzalloc(dev, sizeof(*dmux), GFP_KERNEL);
+@@ -791,9 +1007,9 @@
+ 	if (dmux->pc_irq < 0)
+ 		return dmux->pc_irq;
+ 
+-	pc_ack_irq = platform_get_irq_byname(pdev, "pc-ack");
+-	if (pc_ack_irq < 0)
+-		return pc_ack_irq;
++	dmux->pc_ack_irq = platform_get_irq_byname(pdev, "pc-ack");
++	if (dmux->pc_ack_irq < 0)
++		return dmux->pc_ack_irq;
+ 
+ 	dmux->pc = devm_qcom_smem_state_get(dev, "pc", &bit);
+ 	if (IS_ERR(dmux->pc))
+@@ -807,6 +1023,7 @@
+ 				     "Failed to get pc-ack state\n");
+ 	dmux->pc_ack_mask = BIT(bit);
+ 
++	mutex_init(&dmux->pc_lock);
+ 	init_waitqueue_head(&dmux->pc_wait);
+ 	init_completion(&dmux->pc_ack_completion);
+ 	complete_all(&dmux->pc_ack_completion);
+@@ -814,6 +1031,7 @@
+ 	spin_lock_init(&dmux->tx_lock);
+ 	INIT_WORK(&dmux->tx_wakeup_work, bam_dmux_tx_wakeup_work);
+ 	INIT_WORK(&dmux->register_netdev_work, bam_dmux_register_netdev_work);
++	INIT_WORK(&dmux->reopen_work, bam_dmux_reopen_work);
+ 
+ 	for (i = 0; i < BAM_DMUX_NUM_SKB; i++) {
+ 		dmux->rx_skbs[i].dmux = dmux;
+@@ -828,7 +1046,7 @@
+ 	pm_runtime_use_autosuspend(dev);
+ 	pm_runtime_enable(dev);
+ 
+-	ret = devm_request_threaded_irq(dev, pc_ack_irq, NULL, bam_dmux_pc_ack_irq,
++	ret = devm_request_threaded_irq(dev, dmux->pc_ack_irq, NULL, bam_dmux_pc_ack_irq,
+ 					IRQF_ONESHOT, NULL, dmux);
+ 	if (ret)
+ 		goto err_disable_pm;
+@@ -838,17 +1056,17 @@
+ 	if (ret)
+ 		goto err_disable_pm;
+ 
+-	ret = irq_get_irqchip_state(dmux->pc_irq, IRQCHIP_STATE_LINE_LEVEL,
+-				    &dmux->pc_state);
+-	if (ret)
+-		goto err_disable_pm;
+-
+ 	/* Check if remote finished initialization before us */
+-	if (dmux->pc_state) {
+-		if (bam_dmux_power_on(dmux))
+-			bam_dmux_pc_ack(dmux);
+-		else
+-			bam_dmux_power_off(dmux);
++	bam_dmux_pc_update(dmux);
++
++	/* Recover from restarts of the modem */
++	dmux->ssr_nb.notifier_call = bam_dmux_ssr_notify;
++	dmux->ssr_cookie = qcom_register_ssr_notifier(BAM_DMUX_SSR_NAME,
++						      &dmux->ssr_nb);
++	if (IS_ERR(dmux->ssr_cookie)) {
++		ret = PTR_ERR(dmux->ssr_cookie);
++		bam_dmux_power_off(dmux);
++		goto err_disable_pm;
+ 	}
+ 
+ 	return 0;
+@@ -866,8 +1084,12 @@
+ 	LIST_HEAD(list);
+ 	int i;
+ 
++	if (dmux->ssr_cookie)
++		qcom_unregister_ssr_notifier(dmux->ssr_cookie, &dmux->ssr_nb);
++
+ 	/* Unregister network interfaces */
+ 	cancel_work_sync(&dmux->register_netdev_work);
++	cancel_work_sync(&dmux->reopen_work);
+ 	rtnl_lock();
+ 	for (i = 0; i < BAM_DMUX_NUM_CH; ++i)
+ 		if (dmux->netdevs[i])
+--- a/drivers/soc/qcom/smsm.c
++++ b/drivers/soc/qcom/smsm.c
+@@ -333,12 +333,51 @@
+ 	return 0;
+ }
+ 
++/**
++ * smsm_set_irqchip_state() - reset a state bit of a remote system
++ * @irqd:	IRQ handle of the state bit
++ * @which:	IRQCHIP_STATE_LINE_LEVEL
++ * @state:	new level of the state bit
++ *
++ * The state bits of a remote system are not reset when it restarts, so a bit
++ * that was set before the restart stays set and the restarted system setting
++ * it again does not cause an edge. A consumer that knows that the remote
++ * system went down can use this to reset the bit, as the downstream SMSM
++ * driver does for the whole entry on restart. The cached state is updated as
++ * well, so no edge is propagated for this change.
++ */
++static int smsm_set_irqchip_state(struct irq_data *irqd,
++				  enum irqchip_irq_state which, bool state)
++{
++	struct smsm_entry *entry = irq_data_get_irq_chip_data(irqd);
++	irq_hw_number_t irq = irqd_to_hwirq(irqd);
++	u32 val;
++
++	if (which != IRQCHIP_STATE_LINE_LEVEL)
++		return -EINVAL;
++
++	val = readl(entry->remote_state);
++	if (state)
++		val |= BIT(irq);
++	else
++		val &= ~BIT(irq);
++	writel(val, entry->remote_state);
++
++	if (state)
++		set_bit(irq, &entry->last_value);
++	else
++		clear_bit(irq, &entry->last_value);
++
++	return 0;
++}
++
+ static struct irq_chip smsm_irq_chip = {
+ 	.name           = "smsm",
+ 	.irq_mask       = smsm_mask_irq,
+ 	.irq_unmask     = smsm_unmask_irq,
+ 	.irq_set_type	= smsm_set_irq_type,
+ 	.irq_get_irqchip_state = smsm_get_irqchip_state,
++	.irq_set_irqchip_state = smsm_set_irqchip_state,
+ };
+ 
+ /**

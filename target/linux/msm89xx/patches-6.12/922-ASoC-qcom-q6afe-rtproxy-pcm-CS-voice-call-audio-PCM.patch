@@ -1,0 +1,1245 @@
+From: Yoonji Park <koreapyj@dcmys.kr>
+Subject: ASoC: qcom: q6afe-rtproxy-pcm: voice call audio as a sound card
+
+New q6afe child component "qcom,q6afe-rtproxy-pcm" providing PCMs for
+voice call audio (capture = call downlink on AFE RT proxy port 0x2000,
+playback = call uplink on 0x2001, S16_LE mono, 8/16 kHz, 20 ms frames)
+and a minimal machine driver "qcom,q6afe-rtproxy-card" (dummy codec).
+
+The card has two links: "CS Voice" (pcm device 0, DAI "q6afe-rtproxy")
+for circuit switched calls and "VoLTE Voice" (pcm device 1, DAI
+"q6afe-rtproxy-volte") for the Q6VOICE_PATH_VOLTE session. Both use the
+same AFE RT proxy ports and vocproc topology, so CS and VoLTE are
+mutually exclusive: opening a stream of one while a stream of the other
+is open fails with -EBUSY.
+
+The commands are paced by an hrtimer, one READ_V2/WRITE_V2 per frame (the
+DSP sends no RT proxy events and returns silence for burst reads). The
+first prepared stream maps the shared buffer, starts and registers both
+proxy ports and starts the q6voice path (q6voice_start_path with the proxy
+ports, MVM attach, START_VOICE); the last hw_free/close, or removal of the
+q6afe parent, tears everything down. A stream without DSP response for 1 s
+is stopped with an xrun.
+
+Three opt-in debug module parameters are read when the voice path starts
+(so a change in /sys/module/q6afe_rtproxy_pcm/parameters/ applies to the
+next open):
+
+ trace       log every q6voice APR command (service, opcode, session
+             handle, rc, DSP status) while the path is started
+ attach      default|mvm|cvs|both, overrides cfg.attach
+ start_voice -1 (default), 0 or 1, overrides cfg.start_voice
+
+The effective path configuration is logged on every path start.
+
+Built on the q6afe RT proxy API and the q6voice path selection.
+
+Signed-off-by: Yoonji Park <koreapyj@dcmys.kr>
+---
+--- /dev/null
++++ b/Documentation/devicetree/bindings/sound/qcom,q6afe-rtproxy-pcm.yaml
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/sound/qcom,q6afe-rtproxy-pcm.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Qualcomm Q6AFE real-time proxy ports PCM
++
++maintainers:
++  - Krzysztof Kozlowski <krzysztof.kozlowski@linaro.org>
++  - Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
++
++description:
++  Exposes voice call audio of the Q6 DSP (modem firmware) as PCM devices:
++  DAI 0 attaches to the circuit switched call session ("default modem
++  voice"), DAI 1 ("q6afe-rtproxy-volte") to the VoLTE call session
++  ("default volte voice"). Both use the same ports, so only one of them
++  can be open at a time. On both, capture is the call downlink (AFE RT proxy
++  port 0x2000),
++  playback is the call uplink (AFE RT proxy port 0x2001). The node must be a
++  child of the Q6AFE service node, as it uses the AFE service for the proxy
++  ports and the shared memory mapping. The voice session (q6voice) is
++  started when the first PCM stream is prepared and stopped when the last
++  one is released.
++
++allOf:
++  - $ref: dai-common.yaml#
++
++properties:
++  compatible:
++    enum:
++      - qcom,q6afe-rtproxy-pcm
++
++  "#sound-dai-cells":
++    const: 0
++
++required:
++  - compatible
++  - "#sound-dai-cells"
++
++unevaluatedProperties: false
++
++examples:
++  - |
++    rtproxy {
++        compatible = "qcom,q6afe-rtproxy-pcm";
++        #sound-dai-cells = <0>;
++    };
+--- a/Documentation/devicetree/bindings/sound/qcom,q6afe.yaml
++++ b/Documentation/devicetree/bindings/sound/qcom,q6afe.yaml
+@@ -29,6 +29,12 @@ properties:
+     unevaluatedProperties: false
+     description: Qualcomm DSP audio ports
+ 
++  rtproxy:
++    type: object
++    $ref: /schemas/sound/qcom,q6afe-rtproxy-pcm.yaml#
++    unevaluatedProperties: false
++    description: Voice call audio through the AFE real-time proxy ports
++
+ required:
+   - compatible
+   - dais
+--- a/sound/soc/qcom/Kconfig
++++ b/sound/soc/qcom/Kconfig
+@@ -80,6 +80,18 @@ config SND_SOC_QDSP6_CORE
+ config SND_SOC_QDSP6_AFE
+ 	tristate
+ 
++config SND_SOC_QDSP6_AFE_RTPROXY_PCM
++	tristate "QDSP6 AFE RT proxy CS voice call audio PCM and sound card"
++	depends on SND_SOC_QDSP6_AFE && SND_SOC_QDSP6_Q6VOICE
++	help
++	  Exposes the circuit switched and VoLTE voice call audio of the
++	  QDSP6 as an
++	  ALSA sound card without any codec: capture is the call downlink
++	  and playback the call uplink, both carried by the AFE real-time
++	  proxy ports. The q6voice call path is started automatically while
++	  a PCM stream is in use. Say M if you want to record/inject call
++	  audio from user space on a modem-only MSM8916 board.
++
+ config SND_SOC_QDSP6_AFE_DAI
+ 	tristate
+ 
+--- a/sound/soc/qcom/qdsp6/Makefile
++++ b/sound/soc/qcom/qdsp6/Makefile
+@@ -5,6 +5,7 @@ snd-q6apm-y := q6apm.o audioreach.o topology.o
+ obj-$(CONFIG_SND_SOC_QDSP6_COMMON) += snd-q6dsp-common.o
+ obj-$(CONFIG_SND_SOC_QDSP6_CORE) += q6core.o
+ obj-$(CONFIG_SND_SOC_QDSP6_AFE) += q6afe.o
++obj-$(CONFIG_SND_SOC_QDSP6_AFE_RTPROXY_PCM) += q6afe-rtproxy-pcm.o q6afe-rtproxy-card.o
+ obj-$(CONFIG_SND_SOC_QDSP6_AFE_DAI) += q6afe-dai.o
+ obj-$(CONFIG_SND_SOC_QDSP6_AFE_CLOCKS) += q6afe-clocks.o
+ obj-$(CONFIG_SND_SOC_QDSP6_ADM) += q6adm.o
+--- /dev/null
++++ b/sound/soc/qcom/qdsp6/q6afe-rtproxy-card.c
+@@ -0,0 +1,86 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Minimal machine driver: two DAI links ("CS Voice" = pcm 0, "VoLTE Voice" =
++ * pcm 1) between the q6afe RT proxy PCM component and the dummy codec. No LPASS, MI2S or codec hardware is used.
++ *
++ *	sound {
++ *		compatible = "qcom,q6afe-rtproxy-card";
++ *		model = "MSM8916 Voice";
++ *		sound-dai = <&q6rtproxy>;
++ *	};
++ */
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <sound/soc.h>
++
++#define NUM_LINKS	2
++
++static int q6afe_rtproxy_card_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct snd_soc_dai_link_component *cpus, *platforms;
++	struct snd_soc_dai_link *link;
++	int i;
++	struct snd_soc_card *card;
++	int ret;
++
++	card = devm_kzalloc(dev, sizeof(*card), GFP_KERNEL);
++	link = devm_kcalloc(dev, NUM_LINKS, sizeof(*link), GFP_KERNEL);
++	cpus = devm_kcalloc(dev, NUM_LINKS, sizeof(*cpus), GFP_KERNEL);
++	platforms = devm_kcalloc(dev, NUM_LINKS, sizeof(*platforms),
++				 GFP_KERNEL);
++	if (!card || !link || !cpus || !platforms)
++		return -ENOMEM;
++
++	card->dev = dev;
++	card->owner = THIS_MODULE;
++	card->driver_name = "q6afe-rtproxy";
++	card->name = "Q6 Voice";
++	snd_soc_of_parse_card_name(card, "model");
++
++	/* the CPU DAI and the PCM of the proxy ports are the same component */
++	ret = snd_soc_of_get_dlc(dev->of_node, NULL, cpus, 0);
++	if (ret)
++		return dev_err_probe(dev, ret, "cannot find the sound-dai\n");
++	/* link 0: the first DAI (sound-dai), link 1: the VoLTE DAI of the same component */
++	cpus[1].of_node = cpus[0].of_node;
++	cpus[1].dai_name = "q6afe-rtproxy-volte";
++
++	for (i = 0; i < NUM_LINKS; i++) {
++		platforms[i].of_node = cpus[0].of_node;
++
++		link[i].name = i ? "VoLTE Voice" : "CS Voice";
++		link[i].stream_name = link[i].name;
++		link[i].cpus = &cpus[i];
++		link[i].num_cpus = 1;
++		link[i].platforms = &platforms[i];
++		link[i].num_platforms = 1;
++		link[i].codecs = &snd_soc_dummy_dlc;
++		link[i].num_codecs = 1;
++		link[i].ignore_suspend = 1;
++	}
++
++	card->dai_link = link;
++	card->num_links = NUM_LINKS;
++
++	return devm_snd_soc_register_card(dev, card);
++}
++
++static const struct of_device_id q6afe_rtproxy_card_of_match[] = {
++	{ .compatible = "qcom,q6afe-rtproxy-card" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, q6afe_rtproxy_card_of_match);
++
++static struct platform_driver q6afe_rtproxy_card_driver = {
++	.probe = q6afe_rtproxy_card_probe,
++	.driver = {
++		.name = "q6afe-rtproxy-card",
++		.of_match_table = q6afe_rtproxy_card_of_match,
++	},
++};
++module_platform_driver(q6afe_rtproxy_card_driver);
++
++MODULE_DESCRIPTION("Sound card for the Q6AFE RT proxy voice call PCM");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/sound/soc/qcom/qdsp6/q6afe-rtproxy-pcm.c
+@@ -0,0 +1,1018 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Circuit switched and VoLTE voice call audio as an ALSA PCM, through the
++ * QDSP6 AFE real-time proxy ports. The CS DAI attaches to the modem's
++ * "default modem voice" CVD session, the VoLTE DAI to "default volte voice";
++ * both use the same ports and cannot be open at the same time (-EBUSY).
++ *
++ *   capture  = call downlink, AFE RT proxy port 0x2000 (READ_V2)
++ *   playback = call uplink,   AFE RT proxy port 0x2001 (WRITE_V2)
++ *
++ * Both are S16_LE mono at 8000 or 16000 Hz and move one 20 ms frame (320 or
++ * 640 bytes) per command. The DSP does not generate any usable RT proxy
++ * events on this platform, so the commands are paced by an hrtimer: one
++ * WRITE_V2 / READ_V2 per frame period, as the DSP expects real-time traffic
++ * (burst reads return silence).
++ *
++ * The first PCM stream that is prepared brings the whole call path up: the
++ * shared buffer is mapped, both proxy ports are started and registered and
++ * the q6voice path (passive MVM session of the modem call, vocproc attached
++ * to the proxy ports, START_VOICE) is started. It is torn down when the last
++ * stream is released (hw_free/close) or the q6afe parent goes away.
++ *
++ * The modem is the full controller of the call; this driver only joins it
++ * as a passive controller. With no call active the q6voice start is expected
++ * to fail or to produce no data; a stalled stream is stopped with an xrun
++ * after RTP_STALL_MS.
++ */
++#include <linux/atomic.h>
++#include <linux/bitmap.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/hrtimer.h>
++#include <linux/kref.h>
++#include <linux/ktime.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/sizes.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <sound/core.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <dt-bindings/sound/qcom,q6afe.h>
++#include "q6afe.h"
++#include "q6voice.h"
++#include "q6voice-common.h"
++
++#define DRV_NAME		"q6afe-rtproxy-pcm"
++
++#define RTP_PORT_DL		0x2000
++#define RTP_PORT_UL		0x2001
++
++/* cpu DAI ids: the call type that is attached to */
++#define RTP_DAI_CS		0
++#define RTP_DAI_VOLTE		1
++
++/* stream index == SNDRV_PCM_STREAM_* */
++#define RTP_UL			SNDRV_PCM_STREAM_PLAYBACK
++#define RTP_DL			SNDRV_PCM_STREAM_CAPTURE
++
++#define RTP_FRAME_MS		20
++#define RTP_SLOTS		8
++#define RTP_MAX_FRAME		640		/* 16 kHz, 20 ms, mono S16 */
++#define RTP_DL_OFFSET		0
++#define RTP_UL_OFFSET		SZ_8K		/* 4K aligned, > SLOTS * MAX_FRAME */
++#define RTP_BUF_SIZE		SZ_16K
++#define RTP_DL_DEPTH		3		/* READ_V2 kept outstanding */
++#define RTP_STALL_MS		1000
++#define RTP_DRAIN_MS		500
++
++struct rtp;
++
++struct rtp_stream {
++	struct rtp *rtp;
++	int dir;
++	struct hrtimer timer;
++	struct q6afe_port *port;
++	bool started;			/* rtp->lock */
++	bool registered;		/* rtp->lock */
++	bool holds;			/* holds a session reference, rtp->lock */
++	struct snd_pcm_substream *ss;	/* rtp->lock for set/clear */
++
++	/* protects everything below and the DSP slot accounting */
++	spinlock_t lock;
++	bool running;
++	bool first;
++	bool stalled;
++	unsigned int pos;		/* bytes, position in the ALSA ring */
++	unsigned int acc;		/* bytes since the last period elapsed */
++	unsigned int seq;
++	unsigned int outstanding;
++	DECLARE_BITMAP(busy, RTP_SLOTS);
++	ktime_t last_done;
++	unsigned int errors;
++
++	/* DL completions run in process context; close waits for them */
++	atomic_t in_cb;
++	wait_queue_head_t cb_wait;
++};
++
++struct rtp {
++	struct kref ref;
++	struct device *dev;
++	struct q6voice *voice;
++
++	struct mutex lock;		/* session state below */
++	void *buf;
++	dma_addr_t dma;
++	u32 handle;
++	bool mapped;
++	bool voice_on;
++	bool trace_on;		/* q6voice trace hook is ours */
++	bool dead;
++	unsigned int users;
++	enum q6voice_path_type path;	/* of the open streams, rtp->lock */
++	unsigned int rate;
++	unsigned int frame;		/* bytes */
++
++	struct rtp_stream st[2];
++};
++
++/* buffer >= periods_min * period_bytes_min = RTP_MAX_FRAME: a frame always fits */
++static const struct snd_pcm_hardware rtp_hw = {
++	.info = SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_MMAP |
++		SNDRV_PCM_INFO_MMAP_VALID,
++	.formats = SNDRV_PCM_FMTBIT_S16_LE,
++	.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000,
++	.rate_min = 8000,
++	.rate_max = 16000,
++	.channels_min = 1,
++	.channels_max = 1,
++	.buffer_bytes_max = SZ_64K,
++	.period_bytes_min = 320,
++	.period_bytes_max = SZ_16K,
++	.periods_min = 2,
++	.periods_max = 128,
++};
++
++static void rtp_release(struct kref *ref)
++{
++	struct rtp *rtp = container_of(ref, struct rtp, ref);
++
++	if (rtp->mapped)	/* the DSP may still write into it: leak */
++		dev_warn(rtp->dev, "buffer still mapped in the DSP, not freeing it\n");
++	else
++		dma_free_coherent(rtp->dev, RTP_BUF_SIZE, rtp->buf, rtp->dma);
++	put_device(rtp->dev);
++	kfree(rtp);
++}
++
++/* ------------------------------------------------------------ ring buffer */
++
++/*
++ * Move one frame between a DSP slot and the ALSA ring and advance the
++ * position. @slot == NULL zero-fills the ring (capture) or skips the copy
++ * (playback). Called with st->lock held and the stream running. Returns true
++ * if a period boundary was crossed.
++ */
++static bool rtp_ring_xfer(struct rtp_stream *st, u8 *slot, unsigned int bytes,
++			  bool to_ring)
++{
++	struct snd_pcm_runtime *rt = st->ss->runtime;
++	unsigned int size = frames_to_bytes(rt, rt->buffer_size);
++	unsigned int period = frames_to_bytes(rt, rt->period_size);
++	unsigned int pos = st->pos, n1 = min(bytes, size - pos);
++	u8 *ring = rt->dma_area;
++
++	if (to_ring) {
++		if (slot) {
++			memcpy(ring + pos, slot, n1);
++			memcpy(ring, slot + n1, bytes - n1);
++		} else {
++			memset(ring + pos, 0, n1);
++			memset(ring, 0, bytes - n1);
++		}
++	} else if (slot) {
++		memcpy(slot, ring + pos, n1);
++		memcpy(slot + n1, ring, bytes - n1);
++	}
++
++	pos += bytes;
++	if (pos >= size)
++		pos -= size;
++	st->pos = pos;
++
++	st->acc += bytes;
++	if (st->acc >= period) {
++		st->acc %= period;
++		return true;
++	}
++	return false;
++}
++
++/* reserve a DSP slot; lock held */
++static int rtp_slot_get(struct rtp_stream *st)
++{
++	unsigned int slot = st->seq % RTP_SLOTS;
++
++	if (test_bit(slot, st->busy))
++		return -EBUSY;
++	set_bit(slot, st->busy);
++	st->seq++;
++	st->outstanding++;
++	return slot;
++}
++
++static void rtp_slot_put(struct rtp_stream *st, unsigned int slot, bool failed)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&st->lock, flags);
++	if (slot < RTP_SLOTS)
++		clear_bit(slot, st->busy);
++	if (st->outstanding)
++		st->outstanding--;
++	if (failed)
++		st->errors++;
++	spin_unlock_irqrestore(&st->lock, flags);
++}
++
++/* no completion for RTP_STALL_MS although commands are pending; lock held */
++static bool rtp_stalled(struct rtp_stream *st)
++{
++	return st->outstanding &&
++	       ktime_ms_delta(ktime_get(), st->last_done) > RTP_STALL_MS;
++}
++
++static void rtp_stall(struct rtp_stream *st)
++{
++	struct rtp *rtp = st->rtp;
++	unsigned long flags;
++
++	dev_warn(rtp->dev, "%s stalled: no DSP response for %d ms (is a call active?)\n",
++		 st->dir == RTP_DL ? "downlink" : "uplink", RTP_STALL_MS);
++	spin_lock_irqsave(&st->lock, flags);
++	st->stalled = true;
++	spin_unlock_irqrestore(&st->lock, flags);
++	snd_pcm_stop_xrun(st->ss);
++}
++
++/* ------------------------------------------------------- DSP completions */
++
++static void rtp_dl_done(void *priv, u32 cookie, u32 status)
++{
++	struct rtp_stream *st = priv;
++	struct rtp *rtp = st->rtp;
++	struct snd_pcm_substream *ss = NULL;
++	bool elapsed = false;
++	unsigned long flags;
++
++	spin_lock_irqsave(&st->lock, flags);
++	if (cookie < RTP_SLOTS)
++		clear_bit(cookie, st->busy);
++	if (st->outstanding)
++		st->outstanding--;
++	st->last_done = ktime_get();
++	if (status)
++		st->errors++;
++	if (st->running && cookie < RTP_SLOTS) {
++		u8 *src = status ? NULL : rtp->buf + RTP_DL_OFFSET +
++					  cookie * rtp->frame;
++
++		ss = st->ss;
++		atomic_inc(&st->in_cb);
++		elapsed = rtp_ring_xfer(st, src, rtp->frame, true);
++	}
++	spin_unlock_irqrestore(&st->lock, flags);
++
++	if (status)
++		dev_warn_ratelimited(rtp->dev, "READ_V2 failed, status 0x%x\n", status);
++	if (!ss)
++		return;
++	if (elapsed)
++		snd_pcm_period_elapsed(ss);
++	if (atomic_dec_and_test(&st->in_cb))
++		wake_up(&st->cb_wait);
++}
++
++static void rtp_ul_done(void *priv, u32 cookie, u32 status)
++{
++	struct rtp_stream *st = priv;
++	unsigned long flags;
++
++	spin_lock_irqsave(&st->lock, flags);
++	if (cookie < RTP_SLOTS)
++		clear_bit(cookie, st->busy);
++	if (st->outstanding)
++		st->outstanding--;
++	st->last_done = ktime_get();
++	if (status)
++		st->errors++;
++	spin_unlock_irqrestore(&st->lock, flags);
++
++	if (status)
++		dev_warn_ratelimited(st->rtp->dev, "WRITE_V2 failed, status 0x%x\n", status);
++}
++
++static const struct q6afe_rt_proxy_ops rtp_dl_ops = { .data_done = rtp_dl_done };
++static const struct q6afe_rt_proxy_ops rtp_ul_ops = { .data_done = rtp_ul_done };
++
++/* ---------------------------------------------------------------- pacing */
++
++static void rtp_dl_issue(struct rtp_stream *st)
++{
++	struct rtp *rtp = st->rtp;
++	unsigned long flags;
++	int slot, ret;
++
++	spin_lock_irqsave(&st->lock, flags);
++	if (!st->running || st->outstanding >= RTP_DL_DEPTH) {
++		spin_unlock_irqrestore(&st->lock, flags);
++		return;
++	}
++	slot = rtp_slot_get(st);
++	spin_unlock_irqrestore(&st->lock, flags);
++	if (slot < 0)
++		return;
++
++	ret = q6afe_rt_proxy_port_read(st->port,
++				       rtp->dma + RTP_DL_OFFSET + slot * rtp->frame,
++				       rtp->handle, rtp->frame, slot);
++	if (ret) {
++		dev_warn_ratelimited(rtp->dev, "READ_V2 not sent: %d\n", ret);
++		rtp_slot_put(st, slot, true);
++	}
++}
++
++static enum hrtimer_restart rtp_dl_tick(struct hrtimer *timer)
++{
++	struct rtp_stream *st = container_of(timer, struct rtp_stream, timer);
++	unsigned long flags;
++	bool stalled;
++	int n, i;
++
++	spin_lock_irqsave(&st->lock, flags);
++	if (!st->running) {
++		spin_unlock_irqrestore(&st->lock, flags);
++		return HRTIMER_NORESTART;
++	}
++	stalled = rtp_stalled(st);
++	/* prime the DSP with a few reads, then one per frame period */
++	n = st->first ? RTP_DL_DEPTH : 1;
++	st->first = false;
++	spin_unlock_irqrestore(&st->lock, flags);
++
++	if (stalled) {
++		rtp_stall(st);
++	} else {
++		for (i = 0; i < n; i++)
++			rtp_dl_issue(st);
++	}
++
++	hrtimer_forward_now(timer, ms_to_ktime(RTP_FRAME_MS));
++	return READ_ONCE(st->running) ? HRTIMER_RESTART : HRTIMER_NORESTART;
++}
++
++static enum hrtimer_restart rtp_ul_tick(struct hrtimer *timer)
++{
++	struct rtp_stream *st = container_of(timer, struct rtp_stream, timer);
++	struct rtp *rtp = st->rtp;
++	struct snd_pcm_substream *ss;
++	unsigned long flags;
++	bool elapsed, stalled;
++	int slot, ret;
++
++	spin_lock_irqsave(&st->lock, flags);
++	if (!st->running) {
++		spin_unlock_irqrestore(&st->lock, flags);
++		return HRTIMER_NORESTART;
++	}
++	ss = st->ss;
++	stalled = rtp_stalled(st);
++	slot = stalled ? -EBUSY : rtp_slot_get(st);
++	/*
++	 * The ring is consumed in real time like by a DMA engine, also when
++	 * the DSP is backed up (slot == -EBUSY) so the stream does not stall.
++	 */
++	elapsed = rtp_ring_xfer(st, slot < 0 ? NULL :
++				rtp->buf + RTP_UL_OFFSET + slot * rtp->frame,
++				rtp->frame, false);
++	spin_unlock_irqrestore(&st->lock, flags);
++
++	if (slot >= 0) {
++		ret = q6afe_rt_proxy_port_write(st->port,
++				rtp->dma + RTP_UL_OFFSET + slot * rtp->frame,
++				rtp->handle, rtp->frame, slot);
++		if (ret) {
++			dev_warn_ratelimited(rtp->dev, "WRITE_V2 not sent: %d\n", ret);
++			rtp_slot_put(st, slot, true);
++		}
++	}
++	if (stalled)
++		rtp_stall(st);
++	else if (elapsed)
++		snd_pcm_period_elapsed(ss);
++
++	hrtimer_forward_now(timer, ms_to_ktime(RTP_FRAME_MS));
++	return READ_ONCE(st->running) ? HRTIMER_RESTART : HRTIMER_NORESTART;
++}
++
++/* stop a stream and wait until none of its callbacks is running */
++static void rtp_stream_halt(struct rtp_stream *st)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&st->lock, flags);
++	st->running = false;
++	spin_unlock_irqrestore(&st->lock, flags);
++
++	hrtimer_cancel(&st->timer);
++	wait_event_timeout(st->cb_wait, !atomic_read(&st->in_cb), HZ);
++}
++
++/* --------------------------------------------------------------- session */
++
++static int rtp_port_up(struct rtp *rtp, struct rtp_stream *st)
++{
++	struct q6afe_rt_proxy_cfg cfg = {
++		.sample_rate = rtp->rate,
++		.bit_width = 16,
++		.num_channels = 1,
++		.frame_size = rtp->frame,
++		.jitter_allowance = rtp->frame / 2,
++	};
++	int ret;
++
++	st->port = q6afe_port_get_from_id(rtp->dev, st->dir == RTP_DL ?
++					  RT_PROXY_PORT_001_RX :
++					  RT_PROXY_PORT_001_TX);
++	if (IS_ERR(st->port)) {
++		ret = PTR_ERR(st->port);
++		st->port = NULL;
++		return ret;
++	}
++
++	q6afe_rt_proxy_port_prepare(st->port, &cfg);
++	ret = q6afe_port_start(st->port);
++	if (ret)
++		return ret;
++	st->started = true;
++
++	ret = q6afe_rt_proxy_port_register(st->port, st->dir == RTP_DL ?
++					   &rtp_dl_ops : &rtp_ul_ops, st);
++	if (ret)
++		return ret;
++	st->registered = true;
++	return 0;
++}
++
++/* wait for the DSP to hand back every command after DEVICE_STOP */
++static void rtp_drain(struct rtp *rtp)
++{
++	unsigned long end = jiffies + msecs_to_jiffies(RTP_DRAIN_MS);
++	bool busy;
++	int i;
++
++	do {
++		busy = false;
++		for (i = 0; i < 2; i++) {
++			struct rtp_stream *st = &rtp->st[i];
++
++			spin_lock_irq(&st->lock);
++			if (st->outstanding)
++				busy = true;
++			spin_unlock_irq(&st->lock);
++		}
++		if (!busy)
++			return;
++		msleep(10);
++	} while (time_before(jiffies, end));
++
++	dev_warn(rtp->dev, "DSP did not return all proxy commands\n");
++}
++
++/*
++ * Debug controls, read at every voice path start (so a change through
++ * /sys/module/q6afe_rtproxy_pcm/parameters/ applies to the next open).
++ */
++static bool trace;
++module_param(trace, bool, 0644);
++MODULE_PARM_DESC(trace, "log every q6voice APR command and the path start/stop");
++
++static char *attach = "default";
++module_param(attach, charp, 0644);
++MODULE_PARM_DESC(attach, "override the vocproc attach mode: default|mvm|cvs|both");
++
++static int start_voice = -1;
++module_param(start_voice, int, 0644);
++MODULE_PARM_DESC(start_voice, "override MVM START_VOICE: -1 = default, 0 = skip, 1 = send");
++
++static const char * const rtp_svc_name[] = { "MVM", "CVP", "CVS" };
++static const char * const rtp_attach_name[] = { "mvm", "cvs", "both" };
++
++static void rtp_trace_cb(void *priv, enum q6voice_service_type svc, u32 opcode,
++			 u16 handle, int rc, u32 status)
++{
++	struct rtp *rtp = priv;
++
++	if (status == Q6VOICE_STATUS_NO_RESPONSE)
++		dev_info(rtp->dev, "q6voice %s opcode=0x%08x handle=0x%x rc=%d NO RESPONSE\n",
++			 rtp_svc_name[svc], opcode, handle, rc);
++	else
++		dev_info(rtp->dev, "q6voice %s opcode=0x%08x handle=0x%x rc=%d status=0x%x\n",
++			 rtp_svc_name[svc], opcode, handle, rc, status);
++}
++
++/* applies the module parameters to cfg; rtp->lock held */
++static void rtp_apply_debug_cfg(struct rtp *rtp, struct q6voice_path_cfg *cfg)
++{
++	const char *a = READ_ONCE(attach);
++	int sv = READ_ONCE(start_voice);
++
++	if (a && !strcmp(a, "mvm"))
++		cfg->attach = Q6VOICE_ATTACH_MVM;
++	else if (a && !strcmp(a, "cvs"))
++		cfg->attach = Q6VOICE_ATTACH_CVS;
++	else if (a && !strcmp(a, "both"))
++		cfg->attach = Q6VOICE_ATTACH_BOTH;
++	else if (a && *a && strcmp(a, "default"))
++		dev_warn(rtp->dev, "unknown attach \"%s\", using the default\n", a);
++
++	if (sv == 0 || sv == 1)
++		cfg->start_voice = sv;
++}
++
++/* undoes whatever rtp_session_start() did; rtp->lock held */
++static void rtp_session_stop(struct rtp *rtp)
++{
++	int i, ret;
++
++	if (rtp->voice_on) {
++		ret = q6voice_stop_path(rtp->voice, rtp->path);
++		if (rtp->trace_on) {
++			dev_info(rtp->dev, "voice path %d stopped, rc=%d\n",
++				 rtp->path, ret);
++			q6voice_set_trace(NULL, NULL);
++			rtp->trace_on = false;
++		}
++		if (ret)
++			dev_warn(rtp->dev, "voice stop failed: %d\n", ret);
++		rtp->voice_on = false;
++	}
++
++	for (i = 0; i < 2; i++) {
++		struct rtp_stream *st = &rtp->st[i];
++
++		if (st->started) {
++			ret = q6afe_port_stop(st->port);
++			if (ret)
++				dev_warn(rtp->dev, "port stop failed: %d\n", ret);
++			st->started = false;
++		}
++	}
++
++	rtp_drain(rtp);
++
++	for (i = 0; i < 2; i++) {
++		struct rtp_stream *st = &rtp->st[i];
++
++		if (st->registered) {
++			ret = q6afe_rt_proxy_port_unregister(st->port);
++			if (ret)
++				dev_warn(rtp->dev, "port unregister failed: %d\n", ret);
++			st->registered = false;
++		}
++		if (st->port) {
++			q6afe_port_put(st->port);
++			st->port = NULL;
++		}
++	}
++
++	if (rtp->mapped) {
++		ret = q6afe_memory_unmap(rtp->dev, rtp->handle);
++		if (ret)	/* keep the buffer: the DSP may still own it */
++			dev_warn(rtp->dev, "memory unmap failed: %d\n", ret);
++		else
++			rtp->mapped = false;
++	}
++}
++
++static int rtp_session_start(struct rtp *rtp, unsigned int rate)
++{
++	struct q6voice_path_cfg cfg;
++	int i, ret;
++
++	rtp->rate = rate;
++	rtp->frame = rate / (1000 / RTP_FRAME_MS) * 2;
++
++	for (i = 0; i < 2; i++) {
++		struct rtp_stream *st = &rtp->st[i];
++
++		spin_lock_irq(&st->lock);
++		bitmap_zero(st->busy, RTP_SLOTS);
++		st->outstanding = 0;
++		st->seq = 0;
++		spin_unlock_irq(&st->lock);
++	}
++
++	if (!rtp->mapped) {
++		memset(rtp->buf, 0, RTP_BUF_SIZE);
++		ret = q6afe_memory_map(rtp->dev, rtp->dma, RTP_BUF_SIZE,
++				       &rtp->handle);
++		if (ret)
++			return ret;
++		rtp->mapped = true;
++	}
++
++	/* same order as the proven sequence: uplink port first */
++	ret = rtp_port_up(rtp, &rtp->st[RTP_UL]);
++	if (!ret)
++		ret = rtp_port_up(rtp, &rtp->st[RTP_DL]);
++	if (ret)
++		goto err;
++
++	q6voice_path_cfg_default(&cfg);
++	cfg.rx_afe_port = RTP_PORT_DL;
++	cfg.tx_afe_port = RTP_PORT_UL;
++	rtp_apply_debug_cfg(rtp, &cfg);
++	dev_info(rtp->dev,
++		 "voice path start: path=%d attach=%s start_voice=%d rx_port=0x%x tx_port=0x%x rx_topology=0x%x tx_topology=0x%x rate=%u\n",
++		 rtp->path, rtp_attach_name[cfg.attach], cfg.start_voice,
++		 cfg.rx_afe_port, cfg.tx_afe_port, cfg.rx_topology,
++		 cfg.tx_topology, rate);
++	if (READ_ONCE(trace)) {
++		q6voice_set_trace(rtp_trace_cb, rtp);
++		rtp->trace_on = true;
++	}
++	ret = q6voice_start_path(rtp->voice, rtp->path, &cfg);
++	if (ret) {
++		if (rtp->trace_on) {
++			q6voice_set_trace(NULL, NULL);
++			rtp->trace_on = false;
++		}
++		dev_err(rtp->dev, "cannot start the voice path: %d (no call active?)\n",
++			ret);
++		goto err;
++	}
++	rtp->voice_on = true;
++	return 0;
++
++err:
++	rtp_session_stop(rtp);
++	return ret;
++}
++
++static int rtp_session_get(struct rtp *rtp, unsigned int rate)
++{
++	int ret;
++
++	if (rtp->users) {
++		if (rate != rtp->rate)
++			return -EBUSY;
++		rtp->users++;
++		return 0;
++	}
++
++	ret = rtp_session_start(rtp, rate);
++	if (!ret)
++		rtp->users = 1;
++	return ret;
++}
++
++static void rtp_session_put(struct rtp *rtp)
++{
++	if (rtp->dead || !rtp->users)
++		return;
++	if (!--rtp->users)
++		rtp_session_stop(rtp);
++}
++
++/* drop a stream's session reference (hw_params, hw_free, close) */
++static void rtp_stream_release(struct rtp_stream *st)
++{
++	struct rtp *rtp = st->rtp;
++
++	rtp_stream_halt(st);
++	mutex_lock(&rtp->lock);
++	if (st->holds) {
++		st->holds = false;
++		rtp_session_put(rtp);
++	}
++	spin_lock_irq(&st->lock);
++	st->stalled = false;
++	spin_unlock_irq(&st->lock);
++	mutex_unlock(&rtp->lock);
++}
++
++/* ------------------------------------------------------------ PCM ops */
++
++static int rtp_open(struct snd_soc_component *component,
++		    struct snd_pcm_substream *ss)
++{
++	struct rtp *rtp = snd_soc_component_get_drvdata(component);
++	struct snd_pcm_runtime *runtime = ss->runtime;
++	struct rtp_stream *st = &rtp->st[ss->stream];
++	struct rtp_stream *other = &rtp->st[!ss->stream];
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(ss);
++	enum q6voice_path_type path =
++		snd_soc_rtd_to_cpu(rtd, 0)->id == RTP_DAI_VOLTE ?
++		Q6VOICE_PATH_VOLTE : Q6VOICE_PATH_VOICE;
++	int ret;
++
++	snd_soc_set_runtime_hwparams(ss, &rtp_hw);
++	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
++	if (ret < 0)
++		return ret;
++
++	mutex_lock(&rtp->lock);
++	if (rtp->dead || st->ss) {
++		mutex_unlock(&rtp->lock);
++		return rtp->dead ? -ENODEV : -EBUSY;
++	}
++	/* CS and VoLTE share the proxy ports: only one of them at a time */
++	if (other->ss && rtp->path != path) {
++		mutex_unlock(&rtp->lock);
++		return -EBUSY;
++	}
++	/* the voice session has a single rate, shared by both directions */
++	if (rtp->users) {
++		ret = snd_pcm_hw_constraint_single(runtime,
++						   SNDRV_PCM_HW_PARAM_RATE,
++						   rtp->rate);
++		if (ret < 0) {
++			mutex_unlock(&rtp->lock);
++			return ret;
++		}
++	}
++	kref_get(&rtp->ref);
++	rtp->path = path;
++	st->ss = ss;
++	runtime->private_data = st;
++	mutex_unlock(&rtp->lock);
++	return 0;
++}
++
++static int rtp_close(struct snd_soc_component *component,
++		     struct snd_pcm_substream *ss)
++{
++	struct rtp_stream *st = ss->runtime->private_data;
++	struct rtp *rtp = st->rtp;
++
++	rtp_stream_release(st);
++	mutex_lock(&rtp->lock);
++	st->ss = NULL;
++	mutex_unlock(&rtp->lock);
++	kref_put(&rtp->ref, rtp_release);
++	return 0;
++}
++
++static int rtp_hw_params(struct snd_soc_component *component,
++			 struct snd_pcm_substream *ss,
++			 struct snd_pcm_hw_params *params)
++{
++	struct rtp_stream *st = ss->runtime->private_data;
++	struct rtp *rtp = st->rtp;
++	int ret = 0;
++
++	/* new parameters: give the session up, prepare takes it again */
++	rtp_stream_release(st);
++
++	mutex_lock(&rtp->lock);
++	if (rtp->dead)
++		ret = -ENODEV;
++	else if (rtp->users && params_rate(params) != rtp->rate)
++		ret = -EBUSY;
++	mutex_unlock(&rtp->lock);
++	return ret;
++}
++
++static int rtp_hw_free(struct snd_soc_component *component,
++		       struct snd_pcm_substream *ss)
++{
++	rtp_stream_release(ss->runtime->private_data);
++	return 0;
++}
++
++static int rtp_prepare(struct snd_soc_component *component,
++		       struct snd_pcm_substream *ss)
++{
++	struct rtp_stream *st = ss->runtime->private_data;
++	struct rtp *rtp = st->rtp;
++	int ret = 0;
++
++	rtp_stream_halt(st);
++
++	mutex_lock(&rtp->lock);
++	if (rtp->dead) {
++		ret = -ENODEV;
++		goto out;
++	}
++	spin_lock_irq(&st->lock);
++	if (st->stalled)	/* the call is gone; close and reopen */
++		ret = -EIO;
++	spin_unlock_irq(&st->lock);
++	if (ret)
++		goto out;
++
++	if (!st->holds) {
++		ret = rtp_session_get(rtp, ss->runtime->rate);
++		if (ret)
++			goto out;
++		st->holds = true;
++	}
++
++	spin_lock_irq(&st->lock);
++	st->pos = 0;
++	st->acc = 0;
++	spin_unlock_irq(&st->lock);
++out:
++	mutex_unlock(&rtp->lock);
++	return ret;
++}
++
++static int rtp_trigger(struct snd_soc_component *component,
++		       struct snd_pcm_substream *ss, int cmd)
++{
++	struct rtp_stream *st = ss->runtime->private_data;
++	unsigned long flags;
++
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++		spin_lock_irqsave(&st->lock, flags);
++		st->running = true;
++		st->first = true;
++		st->last_done = ktime_get();
++		spin_unlock_irqrestore(&st->lock, flags);
++		hrtimer_start(&st->timer, 0, HRTIMER_MODE_REL_SOFT);
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++		/* may run inside the timer callback: do not wait for it */
++		spin_lock_irqsave(&st->lock, flags);
++		st->running = false;
++		spin_unlock_irqrestore(&st->lock, flags);
++		hrtimer_try_to_cancel(&st->timer);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static snd_pcm_uframes_t rtp_pointer(struct snd_soc_component *component,
++				     struct snd_pcm_substream *ss)
++{
++	struct rtp_stream *st = ss->runtime->private_data;
++	unsigned long flags;
++	unsigned int pos;
++
++	spin_lock_irqsave(&st->lock, flags);
++	pos = st->pos;
++	spin_unlock_irqrestore(&st->lock, flags);
++	return bytes_to_frames(ss->runtime, pos);
++}
++
++static int rtp_pcm_construct(struct snd_soc_component *component,
++			     struct snd_soc_pcm_runtime *rtd)
++{
++	snd_pcm_set_managed_buffer_all(rtd->pcm, SNDRV_DMA_TYPE_DEV,
++				       component->dev, SZ_64K, SZ_64K);
++	return 0;
++}
++
++static const struct snd_soc_component_driver rtp_component = {
++	.name = DRV_NAME,
++	.open = rtp_open,
++	.close = rtp_close,
++	.hw_params = rtp_hw_params,
++	.hw_free = rtp_hw_free,
++	.prepare = rtp_prepare,
++	.trigger = rtp_trigger,
++	.pointer = rtp_pointer,
++	.pcm_construct = rtp_pcm_construct,
++	.legacy_dai_naming = 1,
++};
++
++#define RTP_DAI_STREAM(_prefix, _name) {				\
++	.stream_name = _prefix " " _name,				\
++	.formats = SNDRV_PCM_FMTBIT_S16_LE,				\
++	.rates = SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_16000,		\
++	.rate_min = 8000,						\
++	.rate_max = 16000,						\
++	.channels_min = 1,						\
++	.channels_max = 1,						\
++}
++
++/*
++ * DAI 0 = circuit switched call ("default modem voice"), DAI 1 = VoLTE call
++ * ("default volte voice"). Both use the same proxy ports and are mutually
++ * exclusive (see rtp_open()).
++ */
++static struct snd_soc_dai_driver rtp_dai[] = {
++	{
++		.name = "q6afe-rtproxy",
++		.playback = RTP_DAI_STREAM("CS Voice", "Uplink"),
++		.capture = RTP_DAI_STREAM("CS Voice", "Downlink"),
++	}, {
++		.name = "q6afe-rtproxy-volte",
++		.id = RTP_DAI_VOLTE,
++		.playback = RTP_DAI_STREAM("VoLTE Voice", "Uplink"),
++		.capture = RTP_DAI_STREAM("VoLTE Voice", "Downlink"),
++	},
++};
++
++/* ----------------------------------------------------------------- probe */
++
++/*
++ * The driver's own reference is dropped by devres after the component has
++ * been unregistered, so rtp stays valid for every PCM callback; streams that
++ * are still open in user space keep it alive until they are closed.
++ */
++static void rtp_devm_put(void *data)
++{
++	struct rtp *rtp = data;
++
++	kref_put(&rtp->ref, rtp_release);
++}
++
++static int rtp_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct rtp *rtp;
++	int i, ret;
++
++	rtp = kzalloc(sizeof(*rtp), GFP_KERNEL);
++	if (!rtp)
++		return -ENOMEM;
++	kref_init(&rtp->ref);
++	mutex_init(&rtp->lock);
++	rtp->dev = get_device(dev);
++
++	rtp->buf = dma_alloc_coherent(dev, RTP_BUF_SIZE, &rtp->dma, GFP_KERNEL);
++	if (!rtp->buf) {
++		put_device(dev);
++		kfree(rtp);
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < 2; i++) {
++		struct rtp_stream *st = &rtp->st[i];
++
++		st->rtp = rtp;
++		st->dir = i;
++		spin_lock_init(&st->lock);
++		atomic_set(&st->in_cb, 0);
++		init_waitqueue_head(&st->cb_wait);
++		hrtimer_init(&st->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
++		st->timer.function = i == RTP_DL ? rtp_dl_tick : rtp_ul_tick;
++	}
++
++	/* q6voice is not bound to a device: the path is started explicitly */
++	rtp->voice = q6voice_create(dev);
++	if (IS_ERR(rtp->voice)) {
++		ret = PTR_ERR(rtp->voice);
++		goto err;
++	}
++
++	platform_set_drvdata(pdev, rtp);
++	ret = devm_add_action_or_reset(dev, rtp_devm_put, rtp);
++	if (ret)
++		return ret;
++
++	return devm_snd_soc_register_component(dev, &rtp_component, rtp_dai,
++					       ARRAY_SIZE(rtp_dai));
++
++err:
++	rtp->mapped = false;
++	kref_put(&rtp->ref, rtp_release);
++	return ret;
++}
++
++/*
++ * Called when the q6afe parent goes away (modem/remoteproc stop, rmmod):
++ * stop the streams, tear the call path down and make sure no stream still
++ * open in user space can reach the DSP again.
++ */
++static void rtp_remove(struct platform_device *pdev)
++{
++	struct rtp *rtp = platform_get_drvdata(pdev);
++	int i;
++
++	mutex_lock(&rtp->lock);
++	rtp->dead = true;
++	for (i = 0; i < 2; i++) {
++		struct rtp_stream *st = &rtp->st[i];
++
++		rtp_stream_halt(st);
++		if (st->ss) {
++			snd_pcm_stream_lock_irq(st->ss);
++			snd_pcm_stop(st->ss, SNDRV_PCM_STATE_DISCONNECTED);
++			snd_pcm_stream_unlock_irq(st->ss);
++		}
++	}
++	if (rtp->users) {
++		rtp_session_stop(rtp);
++		rtp->users = 0;
++	}
++	mutex_unlock(&rtp->lock);
++}
++
++static const struct of_device_id rtp_of_match[] = {
++	{ .compatible = "qcom,q6afe-rtproxy-pcm" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, rtp_of_match);
++
++static struct platform_driver rtp_driver = {
++	.probe = rtp_probe,
++	.remove = rtp_remove,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = rtp_of_match,
++	},
++};
++module_platform_driver(rtp_driver);
++
++MODULE_DESCRIPTION("Q6AFE RT proxy ports: CS voice call audio PCM");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,5 @@
+#!/bin/sh
+# No official package repository exists for this target's kmods: drop that feed line
+f=/etc/apk/repositories.d/distfeeds.list
+[ -f "$f" ] && sed -i '/\/targets\/msm89xx\//d' "$f"
+exit 0

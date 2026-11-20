@@ -1,0 +1,174 @@
+#!/bin/sh
+# SIM detection quirk of the UFI sticks: the SIM socket has no card detect
+# switch. The stock Android pulses GPIO114 high for ~2 s to make the modem
+# detect a (re)inserted card (PhoneFeatures SimDetector). While a uqmid modem
+# is failed with state_failed_reason "sim-missing" do the same every 10 s;
+# nothing runs while a SIM is present.
+
+. /usr/share/libubox/jshn.sh
+
+GPIO_NR=114
+GPIO_CHIP_LABEL="1000000.pinctrl"
+PULSE_PID_FILE="/var/run/ufi-sim-hotplug.pulse.pid"
+SUB_PID_FILE="/var/run/ufi-sim-hotplug.subscribe.pid"
+
+log() {
+	logger -t ufi-sim-hotplug "$*"
+}
+
+gpio_number() {
+	local chip
+
+	for chip in /sys/class/gpio/gpiochip*; do
+		[ "$(cat "$chip/label" 2>/dev/null)" = "$GPIO_CHIP_LABEL" ] || continue
+		echo $(( $(cat "$chip/base") + GPIO_NR ))
+		return 0
+	done
+	return 1
+}
+
+pulse_release() {
+	local nr gpio
+
+	nr=$(gpio_number) || return
+	gpio="/sys/class/gpio/gpio$nr"
+	[ -d "$gpio" ] || return
+	echo 0 > "$gpio/value"
+	echo "$nr" > /sys/class/gpio/unexport
+}
+
+pulse() {
+	local nr gpio
+
+	nr=$(gpio_number) || {
+		log "gpiochip $GPIO_CHIP_LABEL not found"
+		return 1
+	}
+	gpio="/sys/class/gpio/gpio$nr"
+	[ -d "$gpio" ] || echo "$nr" > /sys/class/gpio/export 2>/dev/null
+	[ -d "$gpio" ] || {
+		log "cannot export gpio $nr"
+		return 1
+	}
+	log "no SIM detected, pulsing gpio$nr"
+	# "high" sets the direction to out with the value already high
+	echo high > "$gpio/direction"
+	sleep 2
+	pulse_release
+}
+
+# Is a uqmid modem failed because there is no SIM?
+sim_missing() {
+	local list n i path state reason
+
+	list=$(ubus -t 5 call uqmid list 2>/dev/null) || return 1
+	n=$(jsonfilter -s "$list" -e '@.modems[*].path' 2>/dev/null | wc -l)
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		state=$(jsonfilter -s "$list" -e "@.modems[$i].state" 2>/dev/null)
+		if [ "$state" = "failed" ]; then
+			path=$(jsonfilter -s "$list" -e "@.modems[$i].path" 2>/dev/null)
+			reason=$(ubus -t 5 call "$path" get 2>/dev/null | jsonfilter -e '@.state_failed_reason' 2>/dev/null)
+			[ "$reason" = "sim-missing" ] && return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# The one and only pulse loop. It never ends on its own: evaluate() stops it
+# (SIGTERM) when the SIM is no longer missing. A SIGTERM during the pulse
+# still releases the gpio.
+pulse_loop() {
+	local sl
+
+	trap 'kill $sl 2>/dev/null; pulse_release; exit 0' TERM INT
+	while true; do
+		pulse
+		sleep 10 &
+		sl=$!
+		wait $sl
+	done
+}
+
+pulse_running() {
+	local pid
+
+	pid=$(cat "$PULSE_PID_FILE" 2>/dev/null)
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+pulse_start() {
+	pulse_running && return
+	pulse_loop &
+	echo $! > "$PULSE_PID_FILE"
+}
+
+pulse_stop() {
+	local pid n=0
+
+	pid=$(cat "$PULSE_PID_FILE" 2>/dev/null)
+	rm -f "$PULSE_PID_FILE"
+	[ -n "$pid" ] || return
+	kill "$pid" 2>/dev/null
+	# wait until it is really gone so a new loop can never overlap
+	while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 30 ]; do
+		sleep 1
+		n=$((n + 1))
+	done
+}
+
+evaluate() {
+	if sim_missing; then
+		pulse_start
+	else
+		pulse_stop
+	fi
+}
+
+cleanup() {
+	pulse_stop
+	[ -s "$SUB_PID_FILE" ] && kill "$(cat "$SUB_PID_FILE")" 2>/dev/null
+	rm -f "$SUB_PID_FILE"
+	exit 0
+}
+
+# subscribe to the manager (modem.added/removed) and to all modems that exist
+# (state_changed); returns when the set of modems changed or uqmid went away
+watch() {
+	local list objs
+
+	list=$(ubus -t 5 call uqmid list 2>/dev/null) || return
+	objs="uqmid $(jsonfilter -s "$list" -e '@.modems[*].path' 2>/dev/null | tr '\n' ' ')"
+
+	# shellcheck disable=SC2086
+	sh -c "echo \$\$ > $SUB_PID_FILE; exec ubus -S subscribe $objs" | {
+		local line
+		evaluate
+		while read -r line; do
+			case "$line" in
+				*modem.added*|*modem.removed*)
+					# new set of objects: subscribe again
+					kill "$(cat "$SUB_PID_FILE" 2>/dev/null)" 2>/dev/null
+					;;
+				*)
+					evaluate
+					;;
+			esac
+		done
+	}
+}
+
+main() {
+	trap cleanup INT TERM
+
+	while true; do
+		# wait for uqmid to be available in ubus
+		until ubus -t 5 wait_for uqmid 2>/dev/null; do sleep 1; done
+		watch
+		pulse_stop
+		sleep 2
+	done
+}
+
+main "$@"

@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * 128 KiB reserved for ramoops/pstore: the panic log that U-Boot looks for
+ * ("pstore check") to boot the recovery image after a kernel panic. The same
+ * region (no-map, same record layout: seven 16 KiB dump records and a 16 KiB
+ * console log) is reserved in the U-Boot devicetree, see
+ * package/boot/uboot-msm89xx.
+ *
+ * 0x8c100000 is free of every region of msm8916.dtsi (firmware regions up to
+ * 0x86800000, mpss up to 0x8bd00000, the other remoteproc regions are
+ * allocated by the kernel in 0x86800000-0x8e800000 around static regions)
+ * and of U-Boot's own allocations (0x8c200000 and above).
+ */
+
+/ {
+	reserved-memory {
+		ramoops@8c100000 {
+			compatible = "ramoops";
+			reg = <0x0 0x8c100000 0x0 0x20000>;
+			record-size = <0x4000>;
+			console-size = <0x4000>;
+		};
+	};
+};

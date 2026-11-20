@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The modem (MPSS), WCNSS and WiFi calibration files stay in the stock "modem"
+# (vfat) and "persist" (ext4) partitions; the DT firmware-name properties point
+# the drivers at /lib/firmware/modem and /lib/firmware/persist. Mount them
+# read-only before rmtfs starts the modem.
+#
+# The WCNSS remoteproc requests its firmware at probe time, long before this
+# runs; the request falls back to the sysfs loader and its uevent is emitted
+# before any hotplug handler exists, so nothing would answer it until the
+# 60 s fallback timeout. Re-announce pending requests once the partitions are
+# mounted so the preinit hotplug handler loads them right away.
+
+. /lib/functions.sh
+
+retrigger_pending_firmware() {
+	local req
+
+	for req in /sys/class/firmware/*/loading; do
+		[ -e "$req" ] || continue
+		echo add > "${req%/loading}/uevent"
+	done
+}
+
+mount_firmware_partitions() {
+	local dev
+
+	case "$(board_name)" in
+	generic,ufi-esim)
+		dev="$(find_mmc_part modem)"
+		[ -b "$dev" ] && mount -t vfat -o ro,noatime,shortname=lower "$dev" /lib/firmware/modem ||
+			echo "- cannot mount modem firmware partition -"
+
+		dev="$(find_mmc_part persist)"
+		# noload: do not replay the Android journal, keep the partition untouched
+		[ -b "$dev" ] && mount -t ext4 -o ro,noatime,noload "$dev" /lib/firmware/persist ||
+			echo "- cannot mount persist partition -"
+
+		retrigger_pending_firmware
+		;;
+	esac
+}
+
+boot_hook_add preinit_mount_root mount_firmware_partitions

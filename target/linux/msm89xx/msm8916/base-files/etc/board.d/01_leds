@@ -1,0 +1,15 @@
+. /lib/functions/leds.sh
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+generic,ufi-esim)
+	ucidef_set_led_netdev "wan" "WAN" "green:wan" "wwan0" "link tx rx"
+	ucidef_set_led_wlan "wlan" "WLAN" "blue:wlan" "phy0radio"
+	;;
+esac
+
+board_config_flush
+
+exit 0

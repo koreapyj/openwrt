@@ -1,0 +1,817 @@
+From: Yoonji Park <koreapyj@dcmys.kr>
+Subject: ASoC: qcom: q6afe: add RT proxy port support
+
+Add the AFE real-time (RT) proxy ports 0x2000/0x2001 to q6afe: port
+configuration, shared buffer memory mapping, RT proxy driver registration
+and data read/write commands, plus the RT_PROXY_PORT_001_RX/TX DAI ids.
+Used by the CS voice call audio PCM (922).
+
+Signed-off-by: Yoonji Park <koreapyj@dcmys.kr>
+--- a/include/dt-bindings/sound/qcom,q6dsp-lpass-ports.h
++++ b/include/dt-bindings/sound/qcom,q6dsp-lpass-ports.h
+@@ -139,6 +139,8 @@
+ #define DISPLAY_PORT_RX_5	133
+ #define DISPLAY_PORT_RX_6	134
+ #define DISPLAY_PORT_RX_7	135
++#define RT_PROXY_PORT_001_RX	136
++#define RT_PROXY_PORT_001_TX	137
+ 
+ #define LPASS_CLK_ID_PRI_MI2S_IBIT	1
+ #define LPASS_CLK_ID_PRI_MI2S_EBIT	2
+--- a/sound/soc/qcom/qdsp6/q6afe.c
++++ b/sound/soc/qcom/qdsp6/q6afe.c
+@@ -4,6 +4,7 @@
+ 
+ #include <dt-bindings/sound/qcom,q6afe.h>
+ #include <linux/slab.h>
++#include <linux/sizes.h>
+ #include <linux/kernel.h>
+ #include <linux/uaccess.h>
+ #include <linux/wait.h>
+@@ -28,9 +29,18 @@
+ #define AFE_PORT_CMD_DEVICE_START	0x000100E5
+ #define AFE_PORT_CMD_DEVICE_STOP	0x000100E6
+ #define AFE_PORT_CMD_SET_PARAM_V2	0x000100EF
++#define AFE_SERVICE_CMD_REGISTER_RT_PORT_DRIVER		0x000100E0
++#define AFE_SERVICE_CMD_UNREGISTER_RT_PORT_DRIVER	0x000100E1
++#define AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS		0x000100EA
++#define AFE_SERVICE_CMDRSP_SHARED_MEM_MAP_REGIONS	0x000100EB
++#define AFE_SERVICE_CMD_SHARED_MEM_UNMAP_REGIONS	0x000100EC
++#define AFE_PORT_DATA_CMD_RT_PROXY_PORT_WRITE_V2	0x000100ED
++#define AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2		0x000100EE
++#define AFE_EVENT_RT_PROXY_PORT_STATUS			0x00010105
+ #define AFE_SVC_CMD_SET_PARAM		0x000100f3
+ #define AFE_PORT_CMDRSP_GET_PARAM_V2	0x00010106
+ #define AFE_PARAM_ID_HDMI_CONFIG	0x00010210
++#define AFE_PARAM_ID_RT_PROXY_CONFIG	0x00010213
+ #define AFE_MODULE_AUDIO_DEV_INTERFACE	0x0001020C
+ #define AFE_MODULE_TDM			0x0001028A
+ 
+@@ -72,6 +82,13 @@
+ #define AFE_PORT_CONFIG_I2S_WS_SRC_INTERNAL	0x1
+ #define AFE_LINEAR_PCM_DATA				0x0
+ 
++/* RT proxy config specific */
++#define AFE_API_VERSION_RT_PROXY_CONFIG	0x1
++#define AFE_PORT_ID_RT_PROXY_PORT_001_RX	0x2000
++#define AFE_PORT_ID_RT_PROXY_PORT_001_TX	0x2001
++
++#define AFE_MEMORY_MAP_SHMEM8_4K_POOL	3
++
+ 
+ /* Port IDs */
+ #define AFE_API_VERSION_HDMI_CONFIG	0x1
+@@ -363,6 +380,15 @@
+ #define AFE_CMD_RESP_AVAIL	0
+ #define AFE_CMD_RESP_NONE	1
+ #define AFE_CLK_TOKEN		1024
++#define AFE_STATUS_NO_RESPONSE	0xffffffff
++
++/*
++ * Token of RT proxy read/write commands: the low byte identifies the port
++ * (port token) and the remaining bits carry the caller's cookie.
++ */
++#define AFE_TOKEN_PORT_MASK	0xff
++#define AFE_TOKEN_COOKIE_SHIFT	8
++#define AFE_TOKEN_COOKIE_MAX	(U32_MAX >> AFE_TOKEN_COOKIE_SHIFT)
+ 
+ struct q6afe {
+ 	struct apr_device *apr;
+@@ -373,6 +399,9 @@ struct q6afe {
+ 	wait_queue_head_t wait;
+ 	struct list_head port_list;
+ 	spinlock_t port_list_lock;
++	struct mutex map_lock;
++	u32 mem_map_handle;
++	u32 last_status;
+ };
+ 
+ struct afe_port_cmd_device_start {
+@@ -460,6 +489,58 @@ struct afe_param_id_slimbus_cfg {
+  */
+ } __packed;
+ 
++struct afe_param_id_rt_proxy_port_cfg {
++	u32	rt_proxy_cfg_minor_version;
++	u16	bit_width;
++	u16	interleaved;
++	u16	frame_size;
++	u16	jitter_allowance;
++	u16	low_water_mark;
++	u16	high_water_mark;
++	u32	sample_rate;
++	u16	num_channels;
++	u16	reserved;
++} __packed;
++
++struct afe_service_cmd_rt_port_driver {
++	u16	port_id;
++	u16	reserved;
++} __packed;
++
++struct afe_event_rt_proxy_port_status {
++	u16	port_id;
++	u16	event;
++} __packed;
++
++struct afe_service_cmd_shared_mem_map_regions {
++	u16	mem_pool_id;
++	u16	num_regions;
++	u32	property_flag;
++} __packed;
++
++struct afe_service_shared_map_region_payload {
++	u32	shm_addr_lsw;
++	u32	shm_addr_msw;
++	u32	mem_size_bytes;
++} __packed;
++
++struct afe_service_cmdrsp_shared_mem_map_regions {
++	u32	mem_map_handle;
++} __packed;
++
++struct afe_service_cmd_shared_mem_unmap_regions {
++	u32	mem_map_handle;
++} __packed;
++
++struct afe_port_data_cmd_rt_proxy_port {
++	u16	port_id;
++	u16	reserved;
++	u32	buffer_address_lsw;
++	u32	buffer_address_msw;
++	u32	mem_map_handle;
++	u32	available_bytes;
++} __packed;
++
+ struct afe_clk_cfg {
+ 	u32                  i2s_cfg_minor_version;
+ 	u32                  clk_val1;
+@@ -519,6 +600,7 @@ union afe_port_config {
+ 	struct afe_param_id_i2s_cfg	i2s_cfg;
+ 	struct afe_param_id_tdm_cfg	tdm_cfg;
+ 	struct afe_param_id_cdc_dma_cfg	dma_cfg;
++	struct afe_param_id_rt_proxy_port_cfg	rtproxy;
+ } __packed;
+ 
+ 
+@@ -550,6 +632,10 @@ struct q6afe_port {
+ 	struct q6afe *afe;
+ 	struct kref refcount;
+ 	struct list_head node;
++	/* RT proxy client; rt_lock is held while the callbacks run */
++	struct mutex rt_lock;
++	const struct q6afe_rt_proxy_ops *rt_ops;
++	void *rt_priv;
+ };
+ 
+ struct afe_cmd_remote_lpass_core_hw_vote_request {
+@@ -833,6 +919,10 @@ static struct afe_port_map port_maps[AFE
+ 				RX_CODEC_DMA_RX_6, 1, 1},
+ 	[RX_CODEC_DMA_RX_7] = { AFE_PORT_ID_RX_CODEC_DMA_RX_7,
+ 				RX_CODEC_DMA_RX_7, 1, 1},
++	[RT_PROXY_PORT_001_RX] = { AFE_PORT_ID_RT_PROXY_PORT_001_RX,
++				RT_PROXY_PORT_001_RX, 1, 0},
++	[RT_PROXY_PORT_001_TX] = { AFE_PORT_ID_RT_PROXY_PORT_001_TX,
++				RT_PROXY_PORT_001_TX, 0, 0},
+ };
+ 
+ static void q6afe_port_free(struct kref *ref)
+@@ -868,6 +958,55 @@ static struct q6afe_port *q6afe_find_por
+ 	return ret;
+ }
+ 
++static struct q6afe_port *q6afe_find_port_by_id(struct q6afe *afe, int port_id)
++{
++	struct q6afe_port *p;
++	struct q6afe_port *ret = NULL;
++	unsigned long flags;
++
++	spin_lock_irqsave(&afe->port_list_lock, flags);
++	list_for_each_entry(p, &afe->port_list, node)
++		if (p->id == port_id) {
++			ret = p;
++			kref_get(&p->refcount);
++			break;
++		}
++
++	spin_unlock_irqrestore(&afe->port_list_lock, flags);
++	return ret;
++}
++
++static bool q6afe_port_is_rt_proxy(struct q6afe_port *port)
++{
++	return port->id == AFE_PORT_ID_RT_PROXY_PORT_001_RX ||
++	       port->id == AFE_PORT_ID_RT_PROXY_PORT_001_TX;
++}
++
++static void q6afe_rt_proxy_data_done(struct q6afe_port *port, u32 cookie,
++				     u32 status)
++{
++	mutex_lock(&port->rt_lock);
++	if (port->rt_ops && port->rt_ops->data_done)
++		port->rt_ops->data_done(port->rt_priv, cookie, status);
++	mutex_unlock(&port->rt_lock);
++}
++
++static void q6afe_rt_proxy_event(struct q6afe *afe,
++				 struct afe_event_rt_proxy_port_status *ev)
++{
++	struct q6afe_port *port;
++
++	port = q6afe_find_port_by_id(afe, ev->port_id);
++	if (!port)
++		return;
++
++	mutex_lock(&port->rt_lock);
++	if (port->rt_ops && port->rt_ops->event)
++		port->rt_ops->event(port->rt_priv, ev->event);
++	mutex_unlock(&port->rt_lock);
++	kref_put(&port->refcount, q6afe_port_free);
++}
++
+ static int q6afe_callback(struct apr_device *adev, struct apr_resp_pkt *data)
+ {
+ 	struct q6afe *afe = dev_get_drvdata(&adev->dev);
+@@ -890,6 +1029,8 @@ static int q6afe_callback(struct apr_dev
+ 		case AFE_PORT_CMD_DEVICE_STOP:
+ 		case AFE_PORT_CMD_DEVICE_START:
+ 		case AFE_SVC_CMD_SET_PARAM:
++		case AFE_SERVICE_CMD_REGISTER_RT_PORT_DRIVER:
++		case AFE_SERVICE_CMD_UNREGISTER_RT_PORT_DRIVER:
+ 			port = q6afe_find_port(afe, hdr->token);
+ 			if (port) {
+ 				port->result = *res;
+@@ -900,12 +1041,57 @@ static int q6afe_callback(struct apr_dev
+ 				wake_up(&afe->wait);
+ 			}
+ 			break;
++		case AFE_PORT_DATA_CMD_RT_PROXY_PORT_WRITE_V2:
++		case AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2:
++			port = q6afe_find_port(afe,
++					       hdr->token & AFE_TOKEN_PORT_MASK);
++			if (port) {
++				q6afe_rt_proxy_data_done(port,
++					hdr->token >> AFE_TOKEN_COOKIE_SHIFT,
++					res->status);
++				kref_put(&port->refcount, q6afe_port_free);
++			}
++			break;
++		case AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS:
++			/*
++			 * Success is reported by the MAP_REGIONS response
++			 * below, so only a failure ends up here. Hand it to
++			 * the waiter through the response slot it waits on.
++			 */
++			if (res->status) {
++				afe->result.status = res->status;
++				afe->result.opcode =
++					AFE_SERVICE_CMDRSP_SHARED_MEM_MAP_REGIONS;
++				wake_up(&afe->wait);
++			}
++			break;
++		case AFE_SERVICE_CMD_SHARED_MEM_UNMAP_REGIONS:
++			afe->result = *res;
++			wake_up(&afe->wait);
++			break;
+ 		default:
+ 			dev_err(afe->dev, "Unknown cmd 0x%x\n",	res->opcode);
+ 			break;
+ 		}
+ 	}
+ 		break;
++	case AFE_SERVICE_CMDRSP_SHARED_MEM_MAP_REGIONS: {
++		struct afe_service_cmdrsp_shared_mem_map_regions *rsp =
++								data->payload;
++
++		if (data->payload_size < sizeof(*rsp))
++			break;
++		afe->mem_map_handle = rsp->mem_map_handle;
++		afe->result.status = 0;
++		afe->result.opcode = hdr->opcode;
++		wake_up(&afe->wait);
++		break;
++	}
++	case AFE_EVENT_RT_PROXY_PORT_STATUS:
++		if (data->payload_size >=
++		    sizeof(struct afe_event_rt_proxy_port_status))
++			q6afe_rt_proxy_event(afe, data->payload);
++		break;
+ 	case AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST:
+ 		afe->result.opcode = hdr->opcode;
+ 		afe->result.status = res->status;
+@@ -952,6 +1138,7 @@ static int afe_apr_send_pkt(struct q6afe
+ 
+ 	result->opcode = 0;
+ 	result->status = 0;
++	afe->last_status = AFE_STATUS_NO_RESPONSE;
+ 
+ 	ret = apr_send_pkt(afe->apr, pkt);
+ 	if (ret < 0) {
+@@ -964,12 +1151,15 @@ static int afe_apr_send_pkt(struct q6afe
+ 				 msecs_to_jiffies(TIMEOUT_MS));
+ 	if (!ret) {
+ 		ret = -ETIMEDOUT;
+-	} else if (result->status > 0) {
+-		dev_err(afe->dev, "DSP returned error[%x]\n",
+-			result->status);
+-		ret = -EINVAL;
+ 	} else {
+-		ret = 0;
++		afe->last_status = result->status;
++		if (result->status > 0) {
++			dev_err(afe->dev, "DSP returned error[%x]\n",
++				result->status);
++			ret = -EINVAL;
++		} else {
++			ret = 0;
++		}
+ 	}
+ 
+ err:
+@@ -1491,11 +1681,16 @@ int q6afe_port_start(struct q6afe_port *
+ 	int ret, param_id = port->cfg_type;
+ 	struct apr_pkt *pkt;
+ 	int pkt_size;
++	size_t cfg_size = sizeof(port->port_cfg);
+ 	void *p;
+ 
++	/* the DSP checks the size of the RT proxy config exactly */
++	if (param_id == AFE_PARAM_ID_RT_PROXY_CONFIG)
++		cfg_size = sizeof(port->port_cfg.rtproxy);
++
+ 	ret  = q6afe_port_set_param_v2(port, &port->port_cfg, param_id,
+ 				       AFE_MODULE_AUDIO_DEV_INTERFACE,
+-				       sizeof(port->port_cfg));
++				       cfg_size);
+ 	if (ret) {
+ 		dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
+ 			port_id, ret);
+@@ -1613,6 +1808,10 @@ struct q6afe_port *q6afe_port_get_from_i
+ 	case AFE_PORT_ID_WSA_CODEC_DMA_RX_0 ... AFE_PORT_ID_RX_CODEC_DMA_RX_7:
+ 		cfg_type = AFE_PARAM_ID_CODEC_DMA_CONFIG;
+ 	break;
++	case AFE_PORT_ID_RT_PROXY_PORT_001_RX:
++	case AFE_PORT_ID_RT_PROXY_PORT_001_TX:
++		cfg_type = AFE_PARAM_ID_RT_PROXY_CONFIG;
++		break;
+ 	default:
+ 		dev_err(dev, "Invalid port id 0x%x\n", port_id);
+ 		return ERR_PTR(-EINVAL);
+@@ -1623,6 +1822,7 @@ struct q6afe_port *q6afe_port_get_from_i
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	init_waitqueue_head(&port->wait);
++	mutex_init(&port->rt_lock);
+ 
+ 	port->token = id;
+ 	port->id = port_id;
+@@ -1650,6 +1850,355 @@ void q6afe_port_put(struct q6afe_port *p
+ }
+ EXPORT_SYMBOL_GPL(q6afe_port_put);
+ 
++/**
++ * q6afe_rt_proxy_port_prepare() - Prepare a real-time proxy afe port.
++ *
++ * @port: Instance of afe port
++ * @cfg: RT proxy port configuration
++ *
++ * The configuration is sent to the DSP by q6afe_port_start().
++ */
++void q6afe_rt_proxy_port_prepare(struct q6afe_port *port,
++				 struct q6afe_rt_proxy_cfg *cfg)
++{
++	struct afe_param_id_rt_proxy_port_cfg *pcfg = &port->port_cfg.rtproxy;
++
++	pcfg->rt_proxy_cfg_minor_version = AFE_API_VERSION_RT_PROXY_CONFIG;
++	pcfg->bit_width = cfg->bit_width;
++	pcfg->interleaved = 1;
++	pcfg->frame_size = cfg->frame_size;
++	pcfg->jitter_allowance = cfg->jitter_allowance;
++	pcfg->low_water_mark = cfg->low_water_mark;
++	pcfg->high_water_mark = cfg->high_water_mark;
++	pcfg->sample_rate = cfg->sample_rate;
++	pcfg->num_channels = cfg->num_channels;
++	pcfg->reserved = 0;
++}
++EXPORT_SYMBOL_GPL(q6afe_rt_proxy_port_prepare);
++
++static int q6afe_rt_proxy_port_driver_cmd(struct q6afe_port *port, u32 opcode)
++{
++	struct afe_service_cmd_rt_port_driver *cmd;
++	struct q6afe *afe = port->afe;
++	struct apr_pkt *pkt;
++	int ret, pkt_size;
++	void *p;
++
++	pkt_size = APR_HDR_SIZE + sizeof(*cmd);
++	p = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	pkt = p;
++	cmd = p + APR_HDR_SIZE;
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.src_port = 0;
++	pkt->hdr.dest_port = 0;
++	pkt->hdr.token = port->token;
++	pkt->hdr.opcode = opcode;
++	cmd->port_id = port->id;
++
++	ret = afe_apr_send_pkt(afe, pkt, port, opcode);
++	if (ret)
++		dev_err(afe->dev, "AFE RT port driver cmd 0x%x for port 0x%x failed %d\n",
++			opcode, port->id, ret);
++
++	kfree(pkt);
++	return ret;
++}
++
++/**
++ * q6afe_rt_proxy_port_register() - Register as the driver of a RT proxy port
++ *
++ * @port: Instance of RT proxy afe port
++ * @ops: callbacks for read/write completions and port events
++ * @priv: passed back to the callbacks
++ *
++ * The callbacks are installed before the DSP is told, so no event is missed.
++ *
++ * Return: Will be an negative value on failure or zero on success
++ */
++int q6afe_rt_proxy_port_register(struct q6afe_port *port,
++				 const struct q6afe_rt_proxy_ops *ops,
++				 void *priv)
++{
++	int ret;
++
++	if (!q6afe_port_is_rt_proxy(port) || !ops)
++		return -EINVAL;
++
++	mutex_lock(&port->rt_lock);
++	if (port->rt_ops) {
++		mutex_unlock(&port->rt_lock);
++		return -EBUSY;
++	}
++	port->rt_ops = ops;
++	port->rt_priv = priv;
++	mutex_unlock(&port->rt_lock);
++
++	ret = q6afe_rt_proxy_port_driver_cmd(port,
++				AFE_SERVICE_CMD_REGISTER_RT_PORT_DRIVER);
++	if (ret) {
++		mutex_lock(&port->rt_lock);
++		port->rt_ops = NULL;
++		port->rt_priv = NULL;
++		mutex_unlock(&port->rt_lock);
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6afe_rt_proxy_port_register);
++
++/**
++ * q6afe_rt_proxy_port_unregister() - Unregister from a RT proxy port
++ *
++ * @port: Instance of RT proxy afe port
++ *
++ * The callbacks are removed even if the DSP does not acknowledge the
++ * command; once this returns no callback is running or will run.
++ *
++ * Return: Will be an negative value on failure or zero on success
++ */
++int q6afe_rt_proxy_port_unregister(struct q6afe_port *port)
++{
++	int ret;
++
++	if (!q6afe_port_is_rt_proxy(port))
++		return -EINVAL;
++
++	ret = q6afe_rt_proxy_port_driver_cmd(port,
++				AFE_SERVICE_CMD_UNREGISTER_RT_PORT_DRIVER);
++
++	mutex_lock(&port->rt_lock);
++	port->rt_ops = NULL;
++	port->rt_priv = NULL;
++	mutex_unlock(&port->rt_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6afe_rt_proxy_port_unregister);
++
++static int q6afe_rt_proxy_port_data_cmd(struct q6afe_port *port, u32 opcode,
++					dma_addr_t buf, u32 mem_map_handle,
++					u32 bytes, u32 cookie)
++{
++	struct afe_port_data_cmd_rt_proxy_port *cmd;
++	struct q6afe *afe = port->afe;
++	struct {
++		struct apr_hdr hdr;
++		struct afe_port_data_cmd_rt_proxy_port cmd;
++	} __packed pkt = {};
++	int ret;
++
++	if (!q6afe_port_is_rt_proxy(port) || !bytes ||
++	    cookie > AFE_TOKEN_COOKIE_MAX)
++		return -EINVAL;
++
++	/* the data direction is fixed by the port: 0x2000 out, 0x2001 in */
++	if ((opcode == AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2) !=
++	    (port->id == AFE_PORT_ID_RT_PROXY_PORT_001_RX))
++		return -EINVAL;
++
++	cmd = &pkt.cmd;
++	pkt.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					  APR_HDR_LEN(APR_HDR_SIZE),
++					  APR_PKT_VER);
++	pkt.hdr.pkt_size = sizeof(pkt);
++	pkt.hdr.src_port = 0;
++	pkt.hdr.dest_port = 0;
++	pkt.hdr.token = port->token | (cookie << AFE_TOKEN_COOKIE_SHIFT);
++	pkt.hdr.opcode = opcode;
++
++	cmd->port_id = port->id;
++	cmd->buffer_address_lsw = lower_32_bits(buf);
++	cmd->buffer_address_msw = upper_32_bits(buf);
++	cmd->mem_map_handle = mem_map_handle;
++	cmd->available_bytes = bytes;
++
++	/* completion is reported through ops->data_done, nothing to wait for */
++	ret = apr_send_pkt(afe->apr, (struct apr_pkt *)&pkt);
++	if (ret < 0) {
++		dev_err(afe->dev, "RT proxy cmd 0x%x not transmitted (%d)\n",
++			opcode, ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * q6afe_rt_proxy_port_read() - Hand an empty buffer to the RT proxy RX port
++ *
++ * @port: Instance of RT proxy RX afe port (0x2000)
++ * @buf: bus address of the buffer, inside a region mapped with
++ *	q6afe_memory_map()
++ * @mem_map_handle: handle of that mapping
++ * @bytes: number of bytes, must equal the configured frame size
++ * @cookie: returned in &q6afe_rt_proxy_ops.data_done, at most 24 bits
++ *
++ * Does not sleep. Completion is reported asynchronously.
++ *
++ * Return: Will be an negative value on failure or zero on success
++ */
++int q6afe_rt_proxy_port_read(struct q6afe_port *port, dma_addr_t buf,
++			     u32 mem_map_handle, u32 bytes, u32 cookie)
++{
++	return q6afe_rt_proxy_port_data_cmd(port,
++				AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2,
++				buf, mem_map_handle, bytes, cookie);
++}
++EXPORT_SYMBOL_GPL(q6afe_rt_proxy_port_read);
++
++/**
++ * q6afe_rt_proxy_port_write() - Send a buffer of data to the RT proxy TX port
++ *
++ * @port: Instance of RT proxy TX afe port (0x2001)
++ * @buf: bus address of the buffer, inside a region mapped with
++ *	q6afe_memory_map()
++ * @mem_map_handle: handle of that mapping
++ * @bytes: number of valid bytes, must equal the configured frame size
++ * @cookie: returned in &q6afe_rt_proxy_ops.data_done, at most 24 bits
++ *
++ * Does not sleep. Completion is reported asynchronously.
++ *
++ * Return: Will be an negative value on failure or zero on success
++ */
++int q6afe_rt_proxy_port_write(struct q6afe_port *port, dma_addr_t buf,
++			      u32 mem_map_handle, u32 bytes, u32 cookie)
++{
++	return q6afe_rt_proxy_port_data_cmd(port,
++				AFE_PORT_DATA_CMD_RT_PROXY_PORT_WRITE_V2,
++				buf, mem_map_handle, bytes, cookie);
++}
++EXPORT_SYMBOL_GPL(q6afe_rt_proxy_port_write);
++
++/**
++ * q6afe_memory_map() - Map a physically contiguous buffer into the AFE
++ *
++ * @dev: Pointer to afe child device.
++ * @phys: physical address of the buffer, 4 KiB aligned
++ * @size: size of the buffer in bytes, multiple of 4 KiB
++ * @mem_map_handle: returns the handle to use in data commands
++ *
++ * Return: Will be an negative value on failure or zero on success
++ */
++int q6afe_memory_map(struct device *dev, phys_addr_t phys, size_t size,
++		     u32 *mem_map_handle)
++{
++	struct afe_service_shared_map_region_payload *region;
++	struct afe_service_cmd_shared_mem_map_regions *cmd;
++	struct q6afe *afe = dev_get_drvdata(dev->parent);
++	struct apr_pkt *pkt;
++	int ret, pkt_size;
++	void *p;
++
++	if (!IS_ALIGNED(phys, SZ_4K) || !size || !IS_ALIGNED(size, SZ_4K) ||
++	    size > U32_MAX)
++		return -EINVAL;
++
++	pkt_size = APR_HDR_SIZE + sizeof(*cmd) + sizeof(*region);
++	p = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	pkt = p;
++	cmd = p + APR_HDR_SIZE;
++	region = p + APR_HDR_SIZE + sizeof(*cmd);
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.src_port = 0;
++	pkt->hdr.dest_port = 0;
++	pkt->hdr.token = 0;
++	pkt->hdr.opcode = AFE_SERVICE_CMD_SHARED_MEM_MAP_REGIONS;
++
++	cmd->mem_pool_id = AFE_MEMORY_MAP_SHMEM8_4K_POOL;
++	cmd->num_regions = 1;
++	cmd->property_flag = 0;
++	region->shm_addr_lsw = lower_32_bits(phys);
++	region->shm_addr_msw = upper_32_bits(phys);
++	region->mem_size_bytes = size;
++
++	mutex_lock(&afe->map_lock);
++	ret = afe_apr_send_pkt(afe, pkt, NULL,
++			       AFE_SERVICE_CMDRSP_SHARED_MEM_MAP_REGIONS);
++	if (ret)
++		dev_err(afe->dev, "AFE memory map failed %d\n", ret);
++	else
++		*mem_map_handle = afe->mem_map_handle;
++	mutex_unlock(&afe->map_lock);
++
++	kfree(pkt);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6afe_memory_map);
++
++/**
++ * q6afe_memory_unmap() - Remove a mapping created by q6afe_memory_map()
++ *
++ * @dev: Pointer to afe child device.
++ * @mem_map_handle: handle returned by q6afe_memory_map()
++ *
++ * Return: Will be an negative value on failure or zero on success
++ */
++int q6afe_memory_unmap(struct device *dev, u32 mem_map_handle)
++{
++	struct afe_service_cmd_shared_mem_unmap_regions *cmd;
++	struct q6afe *afe = dev_get_drvdata(dev->parent);
++	struct apr_pkt *pkt;
++	int ret, pkt_size;
++	void *p;
++
++	pkt_size = APR_HDR_SIZE + sizeof(*cmd);
++	p = kzalloc(pkt_size, GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++
++	pkt = p;
++	cmd = p + APR_HDR_SIZE;
++
++	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
++					   APR_HDR_LEN(APR_HDR_SIZE),
++					   APR_PKT_VER);
++	pkt->hdr.pkt_size = pkt_size;
++	pkt->hdr.src_port = 0;
++	pkt->hdr.dest_port = 0;
++	pkt->hdr.token = 0;
++	pkt->hdr.opcode = AFE_SERVICE_CMD_SHARED_MEM_UNMAP_REGIONS;
++	cmd->mem_map_handle = mem_map_handle;
++
++	ret = afe_apr_send_pkt(afe, pkt, NULL,
++			       AFE_SERVICE_CMD_SHARED_MEM_UNMAP_REGIONS);
++	if (ret)
++		dev_err(afe->dev, "AFE memory unmap failed %d\n", ret);
++
++	kfree(pkt);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(q6afe_memory_unmap);
++
++/**
++ * q6afe_get_last_dsp_status() - Status of the last DSP command that waited
++ *
++ * @dev: Pointer to afe child device.
++ *
++ * Diagnostic helper: the raw DSP status (ADSP_E*) of the most recent
++ * synchronous AFE command, or 0xffffffff if the DSP did not answer it.
++ */
++u32 q6afe_get_last_dsp_status(struct device *dev)
++{
++	struct q6afe *afe = dev_get_drvdata(dev->parent);
++
++	return READ_ONCE(afe->last_status);
++}
++EXPORT_SYMBOL_GPL(q6afe_get_last_dsp_status);
++
+ int q6afe_unvote_lpass_core_hw(struct device *dev, uint32_t hw_block_id,
+ 			       uint32_t client_handle)
+ {
+@@ -1741,6 +2290,7 @@ static int q6afe_probe(struct apr_device
+ 	q6core_get_svc_api_info(adev->svc_id, &afe->ainfo);
+ 	afe->apr = adev;
+ 	mutex_init(&afe->lock);
++	mutex_init(&afe->map_lock);
+ 	init_waitqueue_head(&afe->wait);
+ 	afe->dev = dev;
+ 	INIT_LIST_HEAD(&afe->port_list);
+--- a/sound/soc/qcom/qdsp6/q6afe.h
++++ b/sound/soc/qcom/qdsp6/q6afe.h
+@@ -3,7 +3,11 @@
+ #ifndef __Q6AFE_H__
+ #define __Q6AFE_H__
+ 
+-#define AFE_PORT_MAX		129
++#include <linux/types.h>
++
++struct device;
++
++#define AFE_PORT_MAX		138
+ 
+ #define MSM_AFE_PORT_TYPE_RX 0
+ #define MSM_AFE_PORT_TYPE_TX 1
+@@ -212,6 +216,48 @@ struct q6afe_port_config {
+ 	struct q6afe_cdc_dma_cfg dma_cfg;
+ };
+ 
++/**
++ * struct q6afe_rt_proxy_cfg - configuration of a real-time proxy port
++ * @sample_rate: sampling rate in Hz
++ * @bit_width: bits per sample, the DSP only supports 16
++ * @num_channels: number of interleaved channels
++ * @frame_size: size in bytes of every buffer exchanged with the port
++ * @jitter_allowance: tolerated jitter in bytes
++ * @low_water_mark: bytes, 0 disables LOW_WATER_MARK events
++ * @high_water_mark: bytes, 0 disables HIGH_WATER_MARK events
++ */
++struct q6afe_rt_proxy_cfg {
++	u32	sample_rate;
++	u16	bit_width;
++	u16	num_channels;
++	u16	frame_size;
++	u16	jitter_allowance;
++	u16	low_water_mark;
++	u16	high_water_mark;
++};
++
++/* RT proxy port events, as delivered to &q6afe_rt_proxy_ops.event */
++#define Q6AFE_RT_PROXY_EVENT_START		0
++#define Q6AFE_RT_PROXY_EVENT_STOP		1
++#define Q6AFE_RT_PROXY_EVENT_LOW_WATER_MARK	2
++#define Q6AFE_RT_PROXY_EVENT_HIGH_WATER_MARK	3
++
++/**
++ * struct q6afe_rt_proxy_ops - callbacks of an RT proxy port client
++ * @data_done: a read/write submitted with q6afe_rt_proxy_port_read() or
++ *	q6afe_rt_proxy_port_write() completed. @cookie is the value passed at
++ *	submission, @status the DSP status (0 on success; for a read the buffer
++ *	has been filled on success).
++ * @event: the DSP sent a Q6AFE_RT_PROXY_EVENT_* notification.
++ *
++ * Both callbacks run in process context from the APR receive workqueue and
++ * must neither sleep for long nor call q6afe_rt_proxy_port_unregister().
++ */
++struct q6afe_rt_proxy_ops {
++	void (*data_done)(void *priv, u32 cookie, u32 status);
++	void (*event)(void *priv, u32 event);
++};
++
+ struct q6afe_port;
+ 
+ struct q6afe_port *q6afe_port_get_from_id(struct device *dev, int id);
+@@ -228,6 +274,21 @@ void q6afe_tdm_port_prepare(struct q6afe
+ void q6afe_cdc_dma_port_prepare(struct q6afe_port *port,
+ 				struct q6afe_cdc_dma_cfg *cfg);
+ 
++void q6afe_rt_proxy_port_prepare(struct q6afe_port *port,
++				 struct q6afe_rt_proxy_cfg *cfg);
++int q6afe_rt_proxy_port_register(struct q6afe_port *port,
++				 const struct q6afe_rt_proxy_ops *ops,
++				 void *priv);
++int q6afe_rt_proxy_port_unregister(struct q6afe_port *port);
++int q6afe_rt_proxy_port_read(struct q6afe_port *port, dma_addr_t buf,
++			     u32 mem_map_handle, u32 bytes, u32 cookie);
++int q6afe_rt_proxy_port_write(struct q6afe_port *port, dma_addr_t buf,
++			      u32 mem_map_handle, u32 bytes, u32 cookie);
++int q6afe_memory_map(struct device *dev, phys_addr_t phys, size_t size,
++		     u32 *mem_map_handle);
++int q6afe_memory_unmap(struct device *dev, u32 mem_map_handle);
++u32 q6afe_get_last_dsp_status(struct device *dev);
++
+ int q6afe_port_set_sysclk(struct q6afe_port *port, int clk_id,
+ 			  int clk_src, int clk_root,
+ 			  unsigned int freq, int dir);

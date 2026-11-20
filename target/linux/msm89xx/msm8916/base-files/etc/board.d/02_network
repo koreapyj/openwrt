@@ -1,0 +1,21 @@
+. /lib/functions/uci-defaults.sh
+. /lib/functions/system.sh
+
+board_config_update
+
+case "$(board_name)" in
+generic,ufi-esim)
+	ucidef_set_interface_lan "usb0"
+	ucidef_set_interface "wan" device "/dev/wwan0qmi0" protocol "uqmid"
+	# The USB gadget picks a random MAC address on every boot, so a DHCP
+	# server on the host side would hand out a new lease each time. The
+	# board has no MAC address of its own: derive a stable one from the
+	# eMMC CID.
+	lan_mac=$(macaddr_generate_from_mmc_cid mmcblk0)
+	[ -n "$lan_mac" ] && ucidef_set_interface_macaddr "lan" "$lan_mac"
+	;;
+esac
+
+board_config_flush
+
+exit 0

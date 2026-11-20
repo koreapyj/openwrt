@@ -1,0 +1,16 @@
+#!/bin/sh /etc/rc.common
+# SIM detection pulse of the UFI sticks, see /usr/libexec/ufi-sim-hotplug.
+
+START=80
+USE_PROCD=1
+
+start_service() {
+	. /lib/functions.sh
+
+	[ "$(board_name)" = "generic,ufi-esim" ] || return 0
+
+	procd_open_instance
+	procd_set_param command /usr/libexec/ufi-sim-hotplug
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}

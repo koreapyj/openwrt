@@ -1,0 +1,130 @@
+From: Yoonji Park <koreapyj@dcmys.kr>
+Subject: [PATCH] net: wwan: rpmsg_wwan_ctrl: keep rpmsg endpoint open after port close
+
+The port stop callback destroys the rpmsg endpoint, which closes the SMD
+channel. Some modem firmwares (e.g. MPSS.DPM.1.0.1.c1 on MSM8916) release
+all QMI clients allocated over the channel when it is closed, so client
+IDs obtained by one userspace process are gone as soon as it closes
+/dev/wwan0qmi0. Tools that use separate invocations (uqmi + netifd) then
+fail with timeouts on every request that reuses a client ID.
+
+Create the endpoint on first start and keep it until the driver is
+removed, like Android's qmuxd keeps the channel open. While the port is
+closed, received data is dropped in the rpmsg callback instead of being
+queued to the wwan port (the wwan core would only purge it on the next
+stop). A spinlock orders the flag against the callback so that no skb is
+queued after stop returns. On remove the port is removed first, which
+clears the flag, and the endpoint is destroyed afterwards.
+
+--- a/drivers/net/wwan/rpmsg_wwan_ctrl.c	2026-11-17 07:59:42.394605291 +0000
++++ b/drivers/net/wwan/rpmsg_wwan_ctrl.c	2026-11-17 07:59:42.407605431 +0000
+@@ -5,6 +5,7 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/rpmsg.h>
++#include <linux/spinlock.h>
+ #include <linux/wwan.h>
+ 
+ struct rpmsg_wwan_dev {
+@@ -12,6 +13,9 @@
+ 	struct rpmsg_device *rpdev;
+ 	struct wwan_port *wwan_port;
+ 	struct rpmsg_endpoint *ept;
++	/* Protects @port_open against the rpmsg RX callback */
++	spinlock_t lock;
++	bool port_open;
+ };
+ 
+ static int rpmsg_wwan_ctrl_callback(struct rpmsg_device *rpdev,
+@@ -19,13 +23,18 @@
+ {
+ 	struct rpmsg_wwan_dev *rpwwan = priv;
+ 	struct sk_buff *skb;
++	unsigned long flags;
+ 
+-	skb = alloc_skb(len, GFP_ATOMIC);
+-	if (!skb)
+-		return -ENOMEM;
+-
+-	skb_put_data(skb, buf, len);
+-	wwan_port_rx(rpwwan->wwan_port, skb);
++	/* The endpoint stays open while the port is closed, drop data then */
++	spin_lock_irqsave(&rpwwan->lock, flags);
++	if (rpwwan->port_open) {
++		skb = alloc_skb(len, GFP_ATOMIC);
++		if (skb) {
++			skb_put_data(skb, buf, len);
++			wwan_port_rx(rpwwan->wwan_port, skb);
++		}
++	}
++	spin_unlock_irqrestore(&rpwwan->lock, flags);
+ 	return 0;
+ }
+ 
+@@ -37,11 +46,23 @@
+ 		.dst = RPMSG_ADDR_ANY,
+ 	};
+ 
+-	strscpy(chinfo.name, rpwwan->rpdev->id.name, sizeof(chinfo.name));
+-	rpwwan->ept = rpmsg_create_ept(rpwwan->rpdev, rpmsg_wwan_ctrl_callback,
+-				       rpwwan, chinfo);
+-	if (!rpwwan->ept)
+-		return -EREMOTEIO;
++	unsigned long flags;
++
++	/* Create the endpoint on first open and keep it until remove: closing
++	 * the channel makes the modem free all QMI clients of the port.
++	 */
++	if (!rpwwan->ept) {
++		strscpy(chinfo.name, rpwwan->rpdev->id.name, sizeof(chinfo.name));
++		rpwwan->ept = rpmsg_create_ept(rpwwan->rpdev,
++					       rpmsg_wwan_ctrl_callback,
++					       rpwwan, chinfo);
++		if (!rpwwan->ept)
++			return -EREMOTEIO;
++	}
++
++	spin_lock_irqsave(&rpwwan->lock, flags);
++	rpwwan->port_open = true;
++	spin_unlock_irqrestore(&rpwwan->lock, flags);
+ 
+ 	return 0;
+ }
+@@ -50,8 +71,14 @@
+ {
+ 	struct rpmsg_wwan_dev *rpwwan = wwan_port_get_drvdata(port);
+ 
+-	rpmsg_destroy_ept(rpwwan->ept);
+-	rpwwan->ept = NULL;
++	unsigned long flags;
++
++	/* Keep the endpoint open, just stop forwarding RX data to the port.
++	 * The wwan core purges the port RX queue after this returns.
++	 */
++	spin_lock_irqsave(&rpwwan->lock, flags);
++	rpwwan->port_open = false;
++	spin_unlock_irqrestore(&rpwwan->lock, flags);
+ }
+ 
+ static int rpmsg_wwan_ctrl_tx(struct wwan_port *port, struct sk_buff *skb)
+@@ -125,6 +152,7 @@
+ 		return -ENOMEM;
+ 
+ 	rpwwan->rpdev = rpdev;
++	spin_lock_init(&rpwwan->lock);
+ 	dev_set_drvdata(&rpdev->dev, rpwwan);
+ 
+ 	/* Register as a wwan port, id.driver_data contains wwan port type */
+@@ -142,7 +170,12 @@
+ {
+ 	struct rpmsg_wwan_dev *rpwwan = dev_get_drvdata(&rpdev->dev);
+ 
++	/* Stops the port (RX is dropped from then on, so the callback never
++	 * touches the freed port) before the endpoint is destroyed.
++	 */
+ 	wwan_remove_port(rpwwan->wwan_port);
++	if (rpwwan->ept)
++		rpmsg_destroy_ept(rpwwan->ept);
+ }
+ 
+ static const struct rpmsg_device_id rpmsg_wwan_ctrl_id_table[] = {

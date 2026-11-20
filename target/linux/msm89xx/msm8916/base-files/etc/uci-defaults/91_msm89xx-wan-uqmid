@@ -1,0 +1,74 @@
+#!/bin/sh
+# Config migration, runs once after the first boot of an image (also after a
+# sysupgrade which keeps /etc/config).
+#
+# uqmid owns /dev/wwan0qmi0. A wan interface of an older config still uses
+# proto qmi (uqmi CLI) and both would fight over the QMI port, so convert
+# proto qmi interfaces on the modem device to proto uqmid. Without uqmid
+# installed the interfaces stay qmi; the modem firmware rejects QMI WDS
+# autoconnect, so qmi then must not request it (qmi.sh defaults to
+# autoconnect=1 for IPv4). The APN is carrier specific and is never invented.
+. /lib/functions.sh
+
+MODEM_DEVICE="/dev/wwan0qmi0"
+CHANGED=0
+
+log() {
+	logger -t uci-defaults "uqmid migration: $*"
+}
+
+migrate_iface() {
+	local cfg="$1"
+	local proto device pdptype auth opt
+
+	config_get proto "$cfg" proto
+	[ "$proto" = "qmi" ] || return 0
+	config_get device "$cfg" device
+	[ "$device" = "$MODEM_DEVICE" ] || return 0
+
+	if [ -x /sbin/uqmid ] && [ -f /lib/netifd/proto/uqmid.sh ]; then
+		config_get pdptype "$cfg" pdptype
+		config_get auth "$cfg" auth
+
+		# qmi.sh: pdptype ip (default), ipv6, ipv4v6
+		case "$(echo "$pdptype" | tr 'A-Z' 'a-z')" in
+			ipv6) uci -q set network.$cfg.iptype='ipv6' ;;
+			ipv4v6) uci -q set network.$cfg.iptype='ipv4v6' ;;
+			*) uci -q set network.$cfg.iptype='ipv4' ;;
+		esac
+
+		# qmi.sh: auth none|pap|chap|both
+		uci -q delete network.$cfg.allowedauth
+		case "$auth" in
+			pap) uci -q add_list network.$cfg.allowedauth='pap' ;;
+			chap) uci -q add_list network.$cfg.allowedauth='chap' ;;
+			both)
+				uci -q add_list network.$cfg.allowedauth='pap'
+				uci -q add_list network.$cfg.allowedauth='chap'
+				;;
+		esac
+
+		# options of qmi.sh which uqmid.sh does not have
+		for opt in pdptype auth autoconnect v6apn profile v6profile modes devpath netdev dataport \
+			   dhcp dhcpv6 delegate mtu; do
+			uci -q delete network.$cfg.$opt
+		done
+		uci -q set network.$cfg.proto='uqmid'
+		log "interface '$cfg' converted from proto qmi to uqmid (iptype=$(uci -q get network.$cfg.iptype), apn='$(uci -q get network.$cfg.apn)')"
+	else
+		[ -z "$(uci -q get network.$cfg.autoconnect)" ] || return 0
+		uci -q set network.$cfg.autoconnect='0'
+		log "interface '$cfg' stays proto qmi (uqmid not installed): autoconnect=0"
+	fi
+	CHANGED=1
+}
+
+case "$(board_name)" in
+generic,ufi-esim)
+	config_load network
+	config_foreach migrate_iface interface
+	[ "$CHANGED" = "1" ] && uci -q commit network
+	;;
+esac
+
+exit 0

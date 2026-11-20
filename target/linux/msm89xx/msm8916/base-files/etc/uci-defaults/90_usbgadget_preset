@@ -1,0 +1,24 @@
+. /lib/functions.sh
+
+# Default USB gadget preset for this board (NCM LAN + ACM console). The
+# usbgadget package ships a generic 'ncm' preset without UDC; replace only
+# that unconfigured default (or an empty preset) and keep a preset the user
+# selected (e.g. msm8916-diag), also across sysupgrade with kept settings.
+# board.d must not do this: it runs from preinit on the read-only rom every
+# boot, leaving a stale uncommitted change in /tmp/.uci.
+case "$(board_name)" in
+generic,ufi-esim)
+	name="$(uci -q get usbgadget.@preset[0].name)"
+	udc="$(uci -q get usbgadget.@preset[0].UDC)"
+	if [ -z "$name" ] || { [ "$name" = "ncm" ] && [ -z "$udc" ]; }; then
+		uci -q get usbgadget.@preset[0] >/dev/null || uci -q add usbgadget preset >/dev/null
+		uci -q set usbgadget.@preset[0].name="msm8916"
+		uci -q set usbgadget.@preset[0].UDC="ci_hdrc.0"
+	elif [ -z "$udc" ]; then
+		uci -q set usbgadget.@preset[0].UDC="ci_hdrc.0"
+	fi
+	uci -q commit usbgadget
+	;;
+esac
+
+exit 0

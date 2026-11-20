@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * MSM8916 "UFI" 4G modem stick, eSIM-switching variant.
+ * Stock firmware: Android 4.4.4 "msm8916_32_512" (2025 build), modem HIMI_U01_MODEM_V1.0.
+ * Pinout taken from the stock (vendor) device tree "MSM 8916 512MB MTP" + hardware test:
+ *   GPIO 37  key_freset   (button, active-high, idle low)
+ *   GPIO 71  4g_1         -> green LED
+ *   GPIO 72  4g_type      -> red LED
+ *   GPIO 73  wifistatus   -> blue LED
+ *   GPIO 119 esim1_en, GPIO 14 esim2_en, GPIO 12 esim3_en, GPIO 114 sim_hotplug
+ *            all low = external SIM slot (verified: registers on network)
+ *   GPIO 36 bat1, GPIO 38 exvus, GPIO 106 ftest, GPIO 110 USB ID (pull-up)  -- unused here
+ */
+
+/dts-v1/;
+
+#include "msm8916-ufi.dtsi"
+#include "msm8916-openwrt-ramoops.dtsi"
+
+/ {
+	model = "UFI 4G Modem Stick (eSIM variant)";
+	compatible = "generic,ufi-esim", "qcom,msm8916";
+
+	aliases {
+		led-boot = &led_r;
+		led-failsafe = &led_r;
+		led-running = &led_r;
+		led-upgrade = &led_r;
+	};
+};
+
+&button_restart {
+	gpios = <&tlmm 37 GPIO_ACTIVE_HIGH>;
+};
+
+&button_default {
+	pins = "gpio37";
+	bias-pull-down;
+};
+
+/* green: 4G status (stock "4g_1") */
+&led_g {
+	gpios = <&tlmm 71 GPIO_ACTIVE_HIGH>;
+	function = LED_FUNCTION_WAN;
+};
+
+/* red: stock "4g_type"; used as power/heartbeat here */
+&led_r {
+	gpios = <&tlmm 72 GPIO_ACTIVE_HIGH>;
+	function = LED_FUNCTION_POWER;
+};
+
+/* blue: WiFi status (stock "wifistatus") */
+&led_b {
+	gpios = <&tlmm 73 GPIO_ACTIVE_HIGH>;
+	function = LED_FUNCTION_WLAN;
+};
+
+&gpio_leds_default {
+	pins = "gpio71", "gpio72", "gpio73";
+};
+
+/* GPS: modem requests memory through the memshare QMI service (needs memshare patches) */
+&gps_mem {
+	status = "okay";
+};
+
+&memshare {
+	status = "okay";
+};
+
+/*
+ * Audio stage 1: only the APR bus to the modem QDSP6 with its q6core and q6afe
+ * services (answered by the modem firmware on "apr_audio_svc"). The q6asm/q6adm
+ * services have no driver yet and no sound card is defined; lpass is left alone.
+ */
+/*
+ * Audio stage 3: the modem voice services (MVM/CVS/CVP) for the q6voice
+ * drivers. Probing them sends nothing to the DSP; voice sessions are only
+ * created on request (by the rtproxy PCM driver below). The q6voice-dais
+ * child (ASoC CS-VOICE DAI) is left out; the rtproxy sound card is used.
+ */
+&apr {
+	status = "okay";
+
+	q6mvm: service@9 {
+		compatible = "qcom,q6mvm";
+		reg = <APR_SVC_ADSP_MVM>;
+	};
+
+	q6cvs: service@a {
+		compatible = "qcom,q6cvs";
+		reg = <APR_SVC_ADSP_CVS>;
+	};
+
+	q6cvp: service@b {
+		compatible = "qcom,q6cvp";
+		reg = <APR_SVC_ADSP_CVP>;
+	};
+};
+
+/*
+ * Audio stage 5: CS voice call audio as an ALSA sound card. The rtproxy
+ * child of q6afe is the PCM (capture = call downlink, playback = call
+ * uplink, through the AFE RT proxy ports 0x2000/0x2001); the card ties it to
+ * the dummy codec. No LPASS, MI2S or codec hardware is involved. The call
+ * path is started while a PCM stream is open, not at boot.
+ */
+&q6afe {
+	q6rtproxy: rtproxy {
+		compatible = "qcom,q6afe-rtproxy-pcm";
+		#sound-dai-cells = <0>;
+	};
+};
+
+/ {
+	sound {
+		compatible = "qcom,q6afe-rtproxy-card";
+		model = "MSM8916 Voice";
+		sound-dai = <&q6rtproxy>;
+	};
+};
+
+/*
+ * Proprietary firmware is read from the stock "modem" (vfat) and "persist"
+ * (ext4) partitions, mounted read-only at /lib/firmware/modem and
+ * /lib/firmware/persist by /lib/preinit/79_mount_firmware.
+ */
+&mpss {
+	firmware-name = "modem/image/mba.mbn", "modem/image/modem.mdt";
+	pinctrl-0 = <&sim_ctrl_default>;
+	pinctrl-names = "default";
+};
+
+&wcnss {
+	firmware-name = "modem/image/wcnss.mdt";
+};
+
+/* read by both wcnss_ctrl (NV download) and wcn36xx (parent node) */
+&wcnss_ctrl {
+	firmware-name = "persist/WCNSS_qcom_wlan_nv.bin";
+};
+
+/*
+ * The PMIC RTC has no backup battery and is read-only for Linux (no
+ * allow-set-time, owned by TZ): it counts from power-on, so loading it
+ * (sysfixtime "hwclock -s") sets the clock back to 1970. Without it the
+ * clock comes from sysfixtime (newest /etc file) and NTP.
+ */
+&pm8916_0 {
+	rtc@6000 {
+		status = "disabled";
+	};
+};
+
+/* This selects the external SIM card slot by default (all eSIM enables low) */
+&tlmm {
+	sim_ctrl_default: sim-ctrl-default-state {
+		esim-en-pins {
+			pins = "gpio12", "gpio14", "gpio119";
+			function = "gpio";
+			bias-disable;
+			output-low;
+		};
+
+		sim-hotplug-pins {
+			pins = "gpio114";
+			function = "gpio";
+			bias-disable;
+			output-low;
+		};
+	};
+};
