@@ -1,0 +1,82 @@
+From: OpenWrt MSM8916 <noreply@openwrt.org>
+Subject: [PATCH] tools: env: lift force_ro of eMMC boot partitions while writing
+
+The eMMC hardware boot partitions (/dev/mmcblkXbootY) are read-only in Linux
+(force_ro=1), so fw_setenv fails to open them. Clear force_ro around the
+write and restore the previous value afterwards. Devices that are not an
+mmcblk*boot* node are not touched.
+
+---
+--- a/tools/env/fw_env.c
++++ b/tools/env/fw_env.c
+@@ -1377,17 +1377,52 @@
+ 	return rc;
+ }
+ 
++/*
++ * The eMMC hardware boot partitions (/dev/mmcblkXbootY) are read-only in Linux
++ * by default (force_ro). Lift the protection while the environment is written
++ * and restore the previous state afterwards.
++ */
++static char mmc_boot_force_ro(const char *devname, char val)
++{
++	char path[128], old = 0;
++	const char *base = strrchr(devname, '/');
++	int fd;
++
++	base = base ? base + 1 : devname;
++	if (strncmp(base, "mmcblk", 6) || !strstr(base, "boot"))
++		return 0;
++
++	snprintf(path, sizeof(path), "/sys/block/%s/force_ro", base);
++	fd = open(path, O_RDWR);
++	if (fd < 0)
++		return 0;
++	if (read(fd, &old, 1) != 1)
++		old = 0;
++	if (lseek(fd, 0, SEEK_SET) != 0 || write(fd, &val, 1) != 1)
++		old = 0;
++	close(fd);
++
++	return old;
++}
++
+ static int flash_io(int mode, void *buf, size_t count)
+ {
+ 	int fd_current, rc;
++	char ro[2] = { 0, 0 };	/* previous force_ro value, 0 = untouched */
++	int i, ndev = have_redund_env ? 2 : 1;
+ 
+ 	/* dev_current: fd_current, erase_current */
++	if (mode == O_RDWR)
++		for (i = 0; i < ndev; i++)
++			ro[i] = mmc_boot_force_ro(DEVNAME(i), '0');
++
+ 	fd_current = open(DEVNAME(dev_current), mode);
+ 	if (fd_current < 0) {
+ 		fprintf(stderr,
+ 			"Can't open %s: %s\n",
+ 			DEVNAME(dev_current), strerror(errno));
+-		return -1;
++		rc = -1;
++		goto restore;
+ 	}
+ 
+ 	if (mode == O_RDWR) {
+@@ -1400,9 +1435,15 @@
+ 		fprintf(stderr,
+ 			"I/O error on %s: %s\n",
+ 			DEVNAME(dev_current), strerror(errno));
+-		return -1;
++		rc = -1;
+ 	}
+ 
++restore:
++	/* reverse order: both copies may live on the same boot partition */
++	for (i = ndev - 1; i >= 0; i--)
++		if (ro[i])
++			mmc_boot_force_ro(DEVNAME(i), ro[i]);
++
+ 	return rc;
+ }
+ 

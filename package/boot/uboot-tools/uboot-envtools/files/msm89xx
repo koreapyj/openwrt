@@ -1,0 +1,24 @@
+[ -e /etc/config/ubootenv ] && exit 0
+
+touch /etc/config/ubootenv
+
+. /lib/uboot-envtools.sh
+. /lib/functions.sh
+
+board=$(board_name)
+
+case "$board" in
+generic,ufi-esim)
+	# only meaningful with mainline U-Boot (uboot-msm89xx) as aboot; the
+	# environment is two redundant 16 KiB copies at the start of the eMMC
+	# hardware boot partition boot1 (CONFIG_ENV_OFFSET{,_REDUND}). Writes
+	# lift the force_ro protection of the partition (see fw_env.c patch).
+	ubootenv_add_uci_config "/dev/mmcblk0boot1" "0x0" "0x4000"
+	ubootenv_add_uci_config "/dev/mmcblk0boot1" "0x4000" "0x4000"
+	;;
+esac
+
+config_load ubootenv
+config_foreach ubootenv_add_app_config ubootenv
+
+exit 0
