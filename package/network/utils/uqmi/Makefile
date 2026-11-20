@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=uqmi
-PKG_RELEASE:=44
+PKG_RELEASE:=45
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=$(PROJECT_GIT)/project/uqmi.git
@@ -23,7 +23,7 @@ define Package/uqmi
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=WWAN
-  DEPENDS:=+libubox +libblobmsg-json +kmod-usb-net +kmod-usb-net-qmi-wwan +wwan
+  DEPENDS:=+libubox +libblobmsg-json +libubus +kmod-usb-net +kmod-usb-net-qmi-wwan +wwan
   TITLE:=Control utility for mobile broadband modems
 endef
 

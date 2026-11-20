@@ -1,0 +1,3957 @@
+From: Yoonji Park <koreapyj@dcmys.kr>
+Subject: [PATCH] uqmi: add --uqmid client mode
+
+uqmid owns the control device, so uqmi can not talk to the modem
+directly while the daemon is running. Add a --uqmid option which
+translates the uqmi commands into calls of the uqmid ubus API and prints
+the results and errors in the same form as the direct mode.
+---
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,15 +12,18 @@ SET(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
+ FIND_PATH(ubox_include_dir libubox/usock.h)
+ FIND_PATH(blobmsg_json_include_dir libubox/blobmsg_json.h)
+ FIND_PATH(json_include_dir json-c/json.h json/json.h json.h)
++FIND_PATH(ubus_include_dir libubus.h)
+ 
+ IF(BUILD_STATIC)
+   FIND_LIBRARY(json_library NAMES libjson.a libjson-c.a)
+   FIND_LIBRARY(blobmsg_json_library NAMES libblobmsg_json.a)
+   FIND_LIBRARY(ubox_library NAMES libubox.a)
++  FIND_LIBRARY(ubus_library NAMES libubus.a)
+ ELSE(BUILD_STATIC)
+   FIND_LIBRARY(json_library NAMES json-c json)
+   FIND_LIBRARY(blobmsg_json_library NAMES blobmsg_json)
+   FIND_LIBRARY(ubox_library NAMES ubox)
++  FIND_LIBRARY(ubus_library NAMES ubus)
+ ENDIF(BUILD_STATIC)
+ 
+ SET(LIBS ${ubox_library} ${blobmsg_json_library} ${json_library})
+@@ -71,13 +74,10 @@ ADD_SUBDIRECTORY(uqmi)
+ 
+ IF(BUILD_UQMID)
+ 	FIND_PATH(talloc_include_dir talloc.h)
+-	FIND_PATH(ubus_include_dir libubus.h)
+ 	IF(BUILD_STATIC)
+ 		FIND_LIBRARY(talloc_library NAMES libtalloc.a)
+-		FIND_LIBRARY(ubus_library NAMES libubus.a)
+ 	ELSE(BUILD_STATIC)
+ 		FIND_LIBRARY(talloc_library NAMES talloc)
+-		FIND_LIBRARY(ubus_library NAMES ubus)
+ 	ENDIF(BUILD_STATIC)
+ 
+ 	ADD_SUBDIRECTORY(uqmid)
+--- a/common/test/Makefile
++++ b/common/test/Makefile
+@@ -1,14 +1,15 @@
+-# Host tests of the shared SMS codec, the QMUX frame helpers, the PDC helpers, the voice/WDS tables and the CLI's decode -> JSON path (not part of the OpenWrt build):
++# Host tests of the shared SMS codec, the QMUX frame helpers, the PDC helpers, the voice/WDS tables, the argument translation of uqmi --uqmid and the CLI's decode -> JSON path (not part of the OpenWrt build):
+ #   make -C common/test check
+ CFLAGS ?= -g -Wall -Werror -fsanitize=address,undefined
+ INC = -I.. -I../../uqmi
+ 
+-check: test_sms test_json test_frame test_pdc test_tables
++check: test_sms test_json test_frame test_pdc test_tables test_ubus_map
+ 	./test_sms vectors.txt
+ 	./test_json vectors.txt
+ 	./test_frame
+ 	./test_pdc
+ 	./test_tables
++	./test_ubus_map
+ 
+ test_sms: test_sms.c ../sms_part.c ../charsets.c
+ 	$(CC) $(CFLAGS) $(INC) $^ -o $@
+@@ -25,5 +26,8 @@ test_pdc: test_pdc.c ../pdc-util.c ../sha1.c
+ test_tables: test_tables.c ../voice-util.c ../wds-util.c
+ 	$(CC) $(CFLAGS) $(INC) $^ -o $@
+ 
++test_ubus_map: test_ubus_map.c ../../uqmi/ubus-map.c
++	$(CC) $(CFLAGS) $(INC) $^ -lm -o $@
++
+ clean:
+-	rm -f test_sms test_json test_frame test_pdc test_tables
++	rm -f test_sms test_json test_frame test_pdc test_tables test_ubus_map
+--- /dev/null
++++ b/common/test/test_ubus_map.c
+@@ -0,0 +1,162 @@
++/* host test: the argument / value translation of uqmi --uqmid (uqmi/ubus-map.c) */
++#include <stdio.h>
++#include <string.h>
++#include "ubus-map.h"
++
++static int fails;
++
++#define CHECK(cond) do { if (!(cond)) { printf("FAIL line %d: %s\n", __LINE__, #cond); fails++; } } while (0)
++#define STREQ(a, b) CHECK(!strcmp((a), (b)))
++
++int main(void)
++{
++	const char *names[UB_MAX_MODES], *s;
++	unsigned int n, mcc, mnc;
++	uint32_t v;
++	uint8_t raw[8];
++	char buf[16];
++
++	/* device matching of uqmid.proto.sh */
++	CHECK(uqmi_ub_device_match("/dev/wwan0qmi0", "/dev/wwan0qmi0", "wwan0qmi0", "/sys/devices/x"));
++	CHECK(uqmi_ub_device_match("wwan0qmi0", "/dev/wwan0qmi0", "wwan0qmi0", NULL));
++	CHECK(uqmi_ub_device_match("/dev/wwan0qmi0", NULL, "wwan0qmi0", NULL));
++	CHECK(uqmi_ub_device_match("cdc-wdm0", "/dev/cdc-wdm0", "cdc-wdm0", NULL));
++	CHECK(uqmi_ub_device_match("/sys/devices/x", "/dev/cdc-wdm0", "cdc-wdm0", "/sys/devices/x"));
++	CHECK(!uqmi_ub_device_match("/dev/cdc-wdm1", "/dev/cdc-wdm0", "cdc-wdm0", "/sys/devices/x"));
++	CHECK(!uqmi_ub_device_match("", "/dev/cdc-wdm0", "cdc-wdm0", NULL));
++	CHECK(!uqmi_ub_device_match(NULL, "/dev/cdc-wdm0", "cdc-wdm0", NULL));
++
++	CHECK(uqmi_ub_path_index("uqmid.modem.2.bearer.17", "bearer", &v) && v == 17);
++	CHECK(uqmi_ub_path_index("uqmid.modem.2", "modem", &v) && v == 2);
++	CHECK(!uqmi_ub_path_index("uqmid.modem.2", "bearer", &v));
++	CHECK(!uqmi_ub_path_index("uqmid.modem.2.bearer.x", "bearer", &v));
++
++	/* operating modes */
++	CHECK(uqmi_ub_opmode_to_power("online", &s) == 0); STREQ(s, "on");
++	CHECK(uqmi_ub_opmode_to_power("low_power", &s) == 0); STREQ(s, "low");
++	CHECK(uqmi_ub_opmode_to_power("persistent_low_power", &s) == 0); STREQ(s, "low");
++	CHECK(uqmi_ub_opmode_to_power("offline", &s) == 0); STREQ(s, "off");
++	CHECK(uqmi_ub_opmode_to_power("reset", &s) == 1);
++	CHECK(uqmi_ub_opmode_to_power("factory_test", &s) == UB_MAP_NA);
++	CHECK(uqmi_ub_opmode_to_power("bogus", &s) == UB_MAP_INVALID);
++	STREQ(uqmi_ub_power_to_opmode("on"), "online");
++	STREQ(uqmi_ub_power_to_opmode("low"), "low_power");
++	STREQ(uqmi_ub_power_to_opmode("off"), "offline");
++	STREQ(uqmi_ub_power_to_opmode("unknown"), "unknown");
++	STREQ(uqmi_ub_power_to_opmode(NULL), "unknown");
++
++	/* network modes */
++	CHECK(uqmi_ub_parse_network_modes("lte,umts", names, &n) == 0 && n == 2);
++	STREQ(names[0], "4g"); STREQ(names[1], "3g");
++	CHECK(uqmi_ub_parse_network_modes("gsm,gsm", names, &n) == 0 && n == 1);
++	CHECK(uqmi_ub_parse_network_modes("lte,all", names, &n) == 0 && n == 1);
++	STREQ(names[0], "any");
++	CHECK(uqmi_ub_parse_network_modes("5gnr", names, &n) == 0 && n == 1);
++	STREQ(names[0], "5g");
++	CHECK(uqmi_ub_parse_network_modes("cdma", names, &n) == UB_MAP_NA);
++	CHECK(uqmi_ub_parse_network_modes("lte,foo", names, &n) == UB_MAP_INVALID);
++	CHECK(uqmi_ub_parse_network_modes("", names, &n) == UB_MAP_INVALID);
++	STREQ(uqmi_ub_preferred_mode("gsm"), "2g");
++	STREQ(uqmi_ub_preferred_mode("wcdma"), "3g");
++	STREQ(uqmi_ub_preferred_mode("auto"), "none");
++
++	/* auth, ip family, pdp type */
++	CHECK(uqmi_ub_auth_names("both", names) == 2); STREQ(names[0], "pap"); STREQ(names[1], "chap");
++	CHECK(uqmi_ub_auth_names("CHAP", names) == 1); STREQ(names[0], "chap");
++	CHECK(uqmi_ub_auth_names("none", names) == 1); STREQ(names[0], "none");
++	CHECK(uqmi_ub_auth_names("eap", names) == UB_MAP_INVALID);
++	STREQ(uqmi_ub_auth_cli_name(true, true), "both");
++	STREQ(uqmi_ub_auth_cli_name(true, false), "pap");
++	STREQ(uqmi_ub_auth_cli_name(false, true), "chap");
++	STREQ(uqmi_ub_auth_cli_name(false, false), "none");
++	CHECK(uqmi_ub_ip_family_to_ip_type("ipv6", &s) == 0); STREQ(s, "ipv6");
++	CHECK(uqmi_ub_ip_family_to_ip_type("unspecified", &s) == 0); STREQ(s, "");
++	CHECK(uqmi_ub_ip_family_to_ip_type("ipv4v6", &s) == UB_MAP_INVALID);
++	CHECK(uqmi_ub_pdp_to_ip_type("ipv4v6", &s) == 0); STREQ(s, "ipv4v6");
++	CHECK(uqmi_ub_pdp_to_ip_type("ppp", &s) == UB_MAP_NA);
++	CHECK(uqmi_ub_pdp_to_ip_type("x", &s) == UB_MAP_INVALID);
++
++	/* PLMN */
++	CHECK(uqmi_ub_plmn_operator_id("450", "06", buf, sizeof(buf))); STREQ(buf, "45006");
++	CHECK(uqmi_ub_plmn_operator_id("450", "6", buf, sizeof(buf))); STREQ(buf, "45006");
++	CHECK(uqmi_ub_plmn_operator_id("310", "260", buf, sizeof(buf))); STREQ(buf, "310260");
++	CHECK(uqmi_ub_plmn_operator_id("310", "026", buf, sizeof(buf))); STREQ(buf, "310026");
++	CHECK(!uqmi_ub_plmn_operator_id("4500", "06", buf, sizeof(buf)));
++	CHECK(!uqmi_ub_plmn_operator_id("450", "x", buf, sizeof(buf)));
++	CHECK(!uqmi_ub_plmn_operator_id("450", NULL, buf, sizeof(buf)));
++	CHECK(uqmi_ub_plmn_split("45006", &mcc, &mnc) && mcc == 450 && mnc == 6);
++	CHECK(uqmi_ub_plmn_split("310260", &mcc, &mnc) && mcc == 310 && mnc == 260);
++	CHECK(!uqmi_ub_plmn_split("4500", &mcc, &mnc));
++	CHECK(!uqmi_ub_plmn_split("", &mcc, &mnc));
++
++	/* radio, registration, storage */
++	STREQ(uqmi_ub_radio_of_access_tech("lte"), "lte");
++	STREQ(uqmi_ub_radio_of_access_tech("hsdpa"), "umts");
++	STREQ(uqmi_ub_radio_of_access_tech("edge"), "gsm");
++	CHECK(!uqmi_ub_radio_of_access_tech("unknown"));
++	CHECK(!uqmi_ub_radio_of_access_tech(NULL));
++	STREQ(uqmi_ub_registration_name("home"), "registered");
++	STREQ(uqmi_ub_registration_name("roaming"), "registered");
++	STREQ(uqmi_ub_registration_name("searching"), "searching");
++	STREQ(uqmi_ub_registration_name("idle"), "not_registered");
++	STREQ(uqmi_ub_registration_name("denied"), "registering_denied");
++	STREQ(uqmi_ub_registration_name("unknown"), "unknown");
++	STREQ(uqmi_ub_storage_name("sim"), "sm");
++	STREQ(uqmi_ub_storage_name("me"), "me");
++	CHECK(!uqmi_ub_storage_name("x"));
++
++	/* voice */
++	STREQ(uqmi_ub_call_state_name("dialing"), "origination");
++	STREQ(uqmi_ub_call_state_name("ringing-out"), "alerting");
++	STREQ(uqmi_ub_call_state_name("ringing-in"), "incoming");
++	STREQ(uqmi_ub_call_state_name("active"), "conversation");
++	STREQ(uqmi_ub_call_state_name("held"), "hold");
++	STREQ(uqmi_ub_call_state_name("terminated"), "end");
++	STREQ(uqmi_ub_call_state_name("bogus"), "unknown");
++	STREQ(uqmi_ub_call_direction_name("incoming"), "mt");
++	STREQ(uqmi_ub_call_direction_name("outgoing"), "mo");
++	STREQ(uqmi_ub_call_direction_name("unknown"), "unknown");
++	STREQ(uqmi_ub_call_mode_name("lte"), "lte");
++	STREQ(uqmi_ub_call_mode_name("hspa"), "umts");
++	STREQ(uqmi_ub_call_mode_name(NULL), "unknown");
++	CHECK((s = uqmi_ub_split_call_arg("3,1234", &v)) && v == 3); STREQ(s, "1234");
++	CHECK(!uqmi_ub_split_call_arg("3,", &v));
++	CHECK(!uqmi_ub_split_call_arg("300,1", &v));
++	CHECK(!uqmi_ub_split_call_arg("x,1", &v));
++	CHECK(!uqmi_ub_split_call_arg("", &v));
++
++	/* numbers */
++	CHECK(uqmi_ub_parse_profile_id("3gpp,2", &v) == 0 && v == 2);
++	CHECK(uqmi_ub_parse_profile_id("3GPP,0x10", &v) == 0 && v == 16);
++	CHECK(uqmi_ub_parse_profile_id("3gpp2,1", &v) == UB_MAP_NA);
++	CHECK(uqmi_ub_parse_profile_id("3gpp", &v) == UB_MAP_INVALID);
++	CHECK(uqmi_ub_parse_profile_id("lte,1", &v) == UB_MAP_INVALID);
++	CHECK(uqmi_ub_parse_profile_id("3gpp,1x", &v) == UB_MAP_INVALID);
++	CHECK(uqmi_ub_parse_uint("255", 255, &v) && v == 255);
++	CHECK(!uqmi_ub_parse_uint("256", 255, &v));
++	CHECK(!uqmi_ub_parse_uint("-1", 255, &v));
++	CHECK(!uqmi_ub_parse_uint("", 255, &v));
++	CHECK(uqmi_ub_parse_hex("0000002A", &v) && v == 42);
++	CHECK(!uqmi_ub_parse_hex("zz", &v));
++	CHECK(!uqmi_ub_parse_hex(NULL, &v));
++	CHECK(uqmi_ub_parse_cell_hex("1A2B3C", &v) && v == 0x1a2b3c);
++	CHECK(uqmi_ub_prefix_to_mask(24) == 0xffffff00u);
++	CHECK(uqmi_ub_prefix_to_mask(0) == 0);
++	CHECK(uqmi_ub_prefix_to_mask(32) == 0xffffffffu);
++	CHECK(uqmi_ub_prefix_to_mask(30) == 0xfffffffcu);
++	CHECK(uqmi_ub_round(-95.4) == -95);
++	CHECK(uqmi_ub_round(-95.6) == -96);
++	CHECK(uqmi_ub_ecio_raw(-7.5) == 15);
++	CHECK(uqmi_ub_ecio_raw(0) == 0);
++
++	/* raw message of --get-raw-message */
++	CHECK(uqmi_ub_parse_raw_sms("07 91 28", raw, sizeof(raw)) == 3 && raw[0] == 0x07 && raw[1] == 0x91 && raw[2] == 0x28);
++	CHECK(uqmi_ub_parse_raw_sms("", raw, sizeof(raw)) == 0);
++	CHECK(uqmi_ub_parse_raw_sms("0g", raw, sizeof(raw)) == -1);
++	CHECK(uqmi_ub_parse_raw_sms("0 1", raw, sizeof(raw)) == -1);
++	CHECK(uqmi_ub_parse_raw_sms("00 01 02 03 04 05 06 07 08", raw, sizeof(raw)) == -1);
++
++	if (!fails)
++		printf("ok\n");
++	return fails ? 1 : 0;
++}
+--- a/uqmi/CMakeLists.txt
++++ b/uqmi/CMakeLists.txt
+@@ -1,12 +1,12 @@
+ 
+ 
+-SET(UQMI uqmi.c dev.c commands.c sms-json.c ${SOURCES})
++SET(UQMI uqmi.c dev.c commands.c sms-json.c ubus-client.c ubus-map.c ${SOURCES})
+ 
+ ADD_EXECUTABLE(uqmi ${UQMI})
+ ADD_DEPENDENCIES(uqmi gen-headers gen-errors)
+ 
+-TARGET_LINK_LIBRARIES(uqmi ${LIBS} common qmigen)
+-TARGET_INCLUDE_DIRECTORIES(uqmi PRIVATE ${ubox_include_dir} ${blobmsg_json_include_dir} ${json_include_dir} ${CMAKE_SOURCE_DIR})
++TARGET_LINK_LIBRARIES(uqmi ${LIBS} ${ubus_library} common qmigen)
++TARGET_INCLUDE_DIRECTORIES(uqmi PRIVATE ${ubox_include_dir} ${ubus_include_dir} ${blobmsg_json_include_dir} ${json_include_dir} ${CMAKE_SOURCE_DIR})
+ 
+ INSTALL(TARGETS uqmi
+ 	RUNTIME DESTINATION sbin
+--- a/uqmi/commands.c
++++ b/uqmi/commands.c
+@@ -195,6 +195,13 @@ void uqmi_add_command(char *arg, int cmd)
+ 	cmds[idx].arg = arg;
+ }
+ 
++/* the commands and options in the order of the command line (for the --uqmid mode) */
++const struct uqmi_cmd *uqmi_get_commands(unsigned int *n)
++{
++	*n = n_cmds;
++	return cmds;
++}
++
+ static void uqmi_print_result(struct blob_attr *data)
+ {
+ 	char *str;
+--- a/uqmi/commands.h
++++ b/uqmi/commands.h
+@@ -83,6 +83,7 @@ extern bool single_line;
+ extern const struct uqmi_cmd_handler uqmi_cmd_handler[];
+ extern struct blob_buf status;
+ void uqmi_add_command(char *arg, int longidx);
++const struct uqmi_cmd *uqmi_get_commands(unsigned int *n);
+ bool uqmi_run_commands(struct qmi_dev *qmi);
+ int uqmi_add_error(const char *msg);
+ 
+--- /dev/null
++++ b/uqmi/ubus-client.c
+@@ -0,0 +1,2980 @@
++/*
++ * uqmi --uqmid: the uqmi commands on top of the ubus API of uqmid (uqmid/README.md, "uqmi --uqmid")
++ *
++ * uqmi does not open the device in this mode. For every command the QMI request of the direct mode is replaced
++ * by the call(s) of the uqmid method which does the same, and the reply is printed in the form of the command.
++ * The common/ext-fmt and sms-json code of the direct mode is used where the reply of uqmid is the same.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#include <arpa/inet.h>
++#include <limits.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <unistd.h>
++
++#include <libubox/blobmsg.h>
++#include <libubox/blobmsg_json.h>
++#include <libubox/uloop.h>
++#include <libubus.h>
++
++#include "uqmi.h"
++#include "commands.h"
++#include "ext-fmt.h"
++#include "pdc-util.h"
++#include "sms-json.h"
++#include "sms_part.h"
++#include "ubus-client.h"
++#include "ubus-map.h"
++#include "wds-util.h"
++
++/* the longest request of uqmid is a network scan or a message send (300 s) */
++#define UB_DEFAULT_TIMEOUT_MS	(10 * 60 * 1000)
++#define UB_PATH_LEN		128
++
++static struct {
++	struct ubus_context *ctx;
++	int timeout;
++	char modem[UB_PATH_LEN];
++	uint32_t modem_id;
++
++	/* the options of the commands (the static variables of commands-*.c in the direct mode) */
++	const char *apn, *auth, *username, *password, *ip_family, *profile;
++	bool autoconnect;
++	const char *pdp_type, *no_roaming;
++	const char *pin, *puk, *new_pin;
++
++	const char *modes, *preference, *roaming, *duration;
++	const char *mcc, *mnc;
++	bool plmn_pending;
++
++	const char *storage;	/* "sim" or "me" */
++	const char *send_smsc, *send_target;
++	bool send_flash;
++
++	int uim_slot, channel_id;
++
++	const char *dl_proto, *ul_proto;
++	bool dl_proto_set, ul_proto_set;
++	uint32_t dl_count, dl_size, ul_count, ul_size;
++	int flow_control;
++
++	const char *pdc_type;
++} G = {
++	.storage = "sim",
++	.channel_id = -1,
++	.flow_control = -1,
++	.pdc_type = "software",
++};
++
++static struct blob_buf args;
++
++/*****************************************************************************/
++/* output */
++
++static void ub_print_result(void)
++{
++	char *str;
++
++	if (!blob_len(status.head))
++		return;
++
++	str = blobmsg_format_json_indent(blob_data(status.head), false, single_line ? -1 : 0);
++	if (!str)
++		return;
++
++	printf("%s\n", str);
++	free(str);
++}
++
++/*
++ * the errors are added to the result like uqmi_add_error() of the direct mode (a JSON string on stdout, printed
++ * with the result of the command)
++ */
++static int __attribute__((format(printf, 1, 2))) ub_fail(const char *fmt, ...)
++{
++	char text[512];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(text, sizeof(text), fmt, ap);
++	va_end(ap);
++
++	if (!status.head)
++		blob_buf_init(&status, 0);
++	blobmsg_add_string(&status, NULL, text);
++
++	return -1;
++}
++
++static int ub_na(const char *name)
++{
++	return ub_fail("--%s: not available with --uqmid", name);
++}
++
++/*****************************************************************************/
++/* the replies: a table (blobmsg) which is freed by the caller */
++
++static struct blob_attr *jget(struct blob_attr *tbl, const char *key)
++{
++	struct blob_attr *cur;
++	size_t rem;
++
++	if (!tbl)
++		return NULL;
++	blobmsg_for_each_attr(cur, tbl, rem) {
++		if (!strcmp(blobmsg_name(cur), key))
++			return cur;
++	}
++	return NULL;
++}
++
++static const char *jstr(struct blob_attr *tbl, const char *key)
++{
++	struct blob_attr *a = jget(tbl, key);
++
++	return a && blobmsg_type(a) == BLOBMSG_TYPE_STRING ? blobmsg_get_string(a) : NULL;
++}
++
++static bool jint(struct blob_attr *tbl, const char *key, int64_t *val)
++{
++	struct blob_attr *a = jget(tbl, key);
++
++	if (!a)
++		return false;
++	switch (blobmsg_type(a)) {
++	case BLOBMSG_TYPE_INT8:
++		*val = blobmsg_get_u8(a);
++		return true;
++	case BLOBMSG_TYPE_INT16:
++		*val = (int16_t) blobmsg_get_u16(a);
++		return true;
++	case BLOBMSG_TYPE_INT32:
++		*val = (int32_t) blobmsg_get_u32(a);
++		return true;
++	case BLOBMSG_TYPE_INT64:
++		*val = (int64_t) blobmsg_get_u64(a);
++		return true;
++	case BLOBMSG_TYPE_DOUBLE:
++		*val = uqmi_ub_round(blobmsg_get_double(a));
++		return true;
++	default:
++		return false;
++	}
++}
++
++static int64_t jint_or(struct blob_attr *tbl, const char *key, int64_t def)
++{
++	int64_t v;
++
++	return jint(tbl, key, &v) ? v : def;
++}
++
++static bool jnum(struct blob_attr *tbl, const char *key, double *val)
++{
++	struct blob_attr *a = jget(tbl, key);
++	int64_t v;
++
++	if (!a)
++		return false;
++	if (blobmsg_type(a) == BLOBMSG_TYPE_DOUBLE) {
++		*val = blobmsg_get_double(a);
++		return true;
++	}
++	if (!jint(tbl, key, &v))
++		return false;
++	*val = v;
++	return true;
++}
++
++static bool jbool(struct blob_attr *tbl, const char *key)
++{
++	struct blob_attr *a = jget(tbl, key);
++
++	return a && blobmsg_type(a) == BLOBMSG_TYPE_BOOL && blobmsg_get_bool(a);
++}
++
++static bool jarray_has(struct blob_attr *tbl, const char *key, const char *str)
++{
++	struct blob_attr *arr = jget(tbl, key), *cur;
++	size_t rem;
++
++	if (!arr)
++		return false;
++	blobmsg_for_each_attr(cur, arr, rem) {
++		if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING && !strcmp(blobmsg_get_string(cur), str))
++			return true;
++	}
++	return false;
++}
++
++static const char *jarray_first(struct blob_attr *tbl, const char *key)
++{
++	struct blob_attr *arr = jget(tbl, key), *cur;
++	size_t rem;
++
++	if (!arr)
++		return NULL;
++	blobmsg_for_each_attr(cur, arr, rem) {
++		if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING)
++			return blobmsg_get_string(cur);
++	}
++	return NULL;
++}
++
++/*****************************************************************************/
++/* ubus calls */
++
++struct ub_reply {
++	struct blob_attr *data;
++};
++
++static struct blob_attr *ub_table_of(struct blob_attr *msg)
++{
++	struct blob_buf rb = {};
++	struct blob_attr *cur, *ret;
++	size_t rem;
++	void *t;
++
++	blob_buf_init(&rb, 0);
++	t = blobmsg_open_table(&rb, NULL);
++	if (msg) {
++		blob_for_each_attr(cur, msg, rem)
++			blobmsg_add_blob(&rb, cur);
++	}
++	blobmsg_close_table(&rb, t);
++	ret = blob_memdup(blob_data(rb.head));
++	blob_buf_free(&rb);
++
++	return ret;
++}
++
++static void ub_data_cb(struct ubus_request *req, int type, struct blob_attr *msg)
++{
++	struct ub_reply *r = req->priv;
++
++	if (!r->data)
++		r->data = ub_table_of(msg);
++}
++
++/* calls a method; the reply (a table, never NULL on success) is returned in @reply if given */
++static int ub_invoke(const char *path, const char *method, struct blob_buf *a, struct blob_attr **reply)
++{
++	struct ub_reply r = {};
++	uint32_t id;
++	int ret;
++
++	if (ubus_lookup_id(G.ctx, path, &id))
++		return ub_fail("%s: object not found", path);
++
++	ret = ubus_invoke(G.ctx, id, method, a ? a->head : NULL, ub_data_cb, &r, G.timeout);
++	if (ret) {
++		/* the {error, message} of uqmid */
++		const char *name = jstr(r.data, "error"), *msg = jstr(r.data, "message");
++
++		if (name)
++			ub_fail("%s: %s", name, msg ? msg : ubus_strerror(ret));
++		else
++			ub_fail("%s %s: %s", path, method, ubus_strerror(ret));
++		free(r.data);
++		return -1;
++	}
++
++	if (!r.data)
++		r.data = ub_table_of(NULL);
++	if (reply)
++		*reply = r.data;
++	else
++		free(r.data);
++
++	return 0;
++}
++
++static int ub_modem(const char *method, struct blob_buf *a, struct blob_attr **reply)
++{
++	return ub_invoke(G.modem, method, a, reply);
++}
++
++/* the SIM object of the modem */
++static int ub_sim(char *path, size_t len)
++{
++	struct blob_attr *m;
++	const char *sim;
++	int ret = -1;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++	sim = jstr(m, "sim");
++	if (!sim || !strcmp(sim, "/"))
++		ub_fail("No SIM");
++	else if (strlen(sim) >= len)
++		ub_fail("Invalid SIM path");
++	else {
++		strcpy(path, sim);
++		ret = 0;
++	}
++	free(m);
++
++	return ret;
++}
++
++/* the changes reply {state, power_state, ...}: only the data of the command is printed */
++static void ub_emit_filtered(struct blob_attr *tbl)
++{
++	struct blob_attr *cur;
++	size_t rem;
++	void *t = blobmsg_open_table(&status, NULL);
++
++	blobmsg_for_each_attr(cur, tbl, rem) {
++		if (!strcmp(blobmsg_name(cur), "state") || !strcmp(blobmsg_name(cur), "power_state"))
++			continue;
++		blobmsg_add_blob(&status, cur);
++	}
++	blobmsg_close_table(&status, t);
++}
++
++/* a modem call whose reply is printed as it is (the extension reads) */
++static int ub_modem_passthrough(const char *method)
++{
++	struct blob_attr *r;
++
++	if (ub_modem(method, NULL, &r))
++		return -1;
++	ub_emit_filtered(r);
++	free(r);
++	return 0;
++}
++
++static int ub_modem_simple(const char *method)
++{
++	return ub_modem(method, NULL, NULL);
++}
++
++static bool ub_state_enabled(const char *state)
++{
++	static const char *const names[] = { "enabled", "searching", "registered", "connecting", "connected",
++					     "disconnecting" };
++	unsigned int i;
++
++	for (i = 0; state && i < sizeof(names) / sizeof(names[0]); i++) {
++		if (!strcmp(state, names[i]))
++			return true;
++	}
++	return false;
++}
++
++/*****************************************************************************/
++/* the modem of the device option */
++
++static int ub_select_modem(const char *device)
++{
++	struct blob_attr *list, *modems, *cur;
++	const char *found = NULL;
++	char found_path[UB_PATH_LEN] = "";
++	unsigned int n = 0;
++	size_t rem;
++
++	if (ub_invoke("uqmid", "list", NULL, &list))
++		return -1;
++
++	modems = jget(list, "modems");
++	blobmsg_for_each_attr(cur, modems, rem) {
++		const char *path = jstr(cur, "path");
++
++		if (!path || strlen(path) >= sizeof(found_path))
++			continue;
++		n++;
++		if (device && !uqmi_ub_device_match(device, jstr(cur, "device"), jstr(cur, "port"),
++						    jstr(cur, "physdev")))
++			continue;
++		if (!found) {
++			found = path;
++			strcpy(found_path, path);
++		} else if (device) {
++			/* the first match wins, like the netifd protocol */
++			break;
++		}
++	}
++	free(list);
++
++	if (!device && n > 1)
++		return ub_fail("More than one modem found, select one with --device");
++	if (!found_path[0])
++		return device ? ub_fail("No modem found for device %s", device) : ub_fail("No modem found");
++
++	strcpy(G.modem, found_path);
++	return ub_invoke(G.modem, "get", NULL, NULL) ? -1 : 0;
++}
++
++/*****************************************************************************/
++/* identity */
++
++static int cmd_get_versions(char *arg)
++{
++	return ub_modem_passthrough("dms_get_versions");
++}
++
++static int cmd_ctl_set_data_format(char *arg)
++{
++	if (strcmp(arg, "802.3") && strcmp(arg, "raw-ip"))
++		return ub_fail("Invalid mode (modes: 802.3, raw-ip)");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "mode", arg);
++	return ub_modem("ctl_set_data_format", &args, NULL);
++}
++
++static int cmd_dms_get_capabilities(char *arg)
++{
++	static const struct {
++		const char *cap;
++		const char *radio[2];
++	} map[] = {
++		{ "cdma-evdo", { "cdma1x", "cdma1xevdo" } },
++		{ "gsm-umts", { "gsm", "umts" } },
++		{ "lte", { "lte" } },
++		{ "lte-advanced", { "lte" } },
++		{ "5gnr", { "5gnr" } },
++	};
++	static const char *const order[] = { "cdma1x", "cdma1xevdo", "gsm", "umts", "lte", "5gnr" };
++	struct blob_attr *m, *sup, *combo, *cap;
++	bool have[6] = {};
++	unsigned int i, j, k;
++	size_t rem, rem2;
++	const char *sim;
++	void *t, *a;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++
++	/* all the radio interfaces of the supported combinations (else the current ones) */
++	sup = jget(m, "supported_capabilities");
++	blobmsg_for_each_attr(combo, sup, rem) {
++		blobmsg_for_each_attr(cap, combo, rem2) {
++			if (blobmsg_type(cap) != BLOBMSG_TYPE_STRING)
++				continue;
++			for (i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
++				if (strcmp(blobmsg_get_string(cap), map[i].cap))
++					continue;
++				for (j = 0; j < 2 && map[i].radio[j]; j++) {
++					for (k = 0; k < 6; k++)
++						have[k] |= !strcmp(order[k], map[i].radio[j]);
++				}
++			}
++		}
++	}
++	if (!have[0] && !have[1] && !have[2] && !have[3] && !have[4] && !have[5]) {
++		blobmsg_for_each_attr(cap, jget(m, "current_capabilities"), rem2) {
++			for (i = 0; blobmsg_type(cap) == BLOBMSG_TYPE_STRING && i < sizeof(map) / sizeof(map[0]); i++) {
++				if (strcmp(blobmsg_get_string(cap), map[i].cap))
++					continue;
++				for (j = 0; j < 2 && map[i].radio[j]; j++) {
++					for (k = 0; k < 6; k++)
++						have[k] |= !strcmp(order[k], map[i].radio[j]);
++				}
++			}
++		}
++	}
++
++	sim = jstr(m, "sim");
++	t = blobmsg_open_table(&status, NULL);
++	/* the channel rates and the data service capability are not known to uqmid */
++	blobmsg_add_string(&status, "sim", sim && strcmp(sim, "/") ? "supported" : "not supported");
++	a = blobmsg_open_array(&status, "networks");
++	for (k = 0; k < 6; k++) {
++		if (have[k])
++			blobmsg_add_string(&status, NULL, order[k]);
++	}
++	blobmsg_close_array(&status, a);
++	blobmsg_close_table(&status, t);
++	free(m);
++
++	return 0;
++}
++
++static int cmd_dms_get_pin_status(char *arg)
++{
++	struct blob_attr *r;
++	const char *s;
++	int64_t v;
++	void *t;
++	int i;
++
++	/* the UIM card status gives the PIN states and the retries of both PINs */
++	if (ub_modem("uim_get_sim_state", NULL, &r))
++		return -1;
++
++	t = blobmsg_open_table(&status, NULL);
++	for (i = 1; i <= 2; i++) {
++		char key[32];
++
++		snprintf(key, sizeof(key), "pin%d_status", i);
++		s = jstr(r, key);
++		if (!s)
++			continue;
++		blobmsg_add_string(&status, key, s);
++		snprintf(key, sizeof(key), "pin%d_verify_tries", i);
++		blobmsg_add_u32(&status, key, jint(r, key, &v) ? v : 0);
++		snprintf(key, sizeof(key), "pin%d_unlock_tries", i);
++		v = jint_or(r, key, 0);
++		snprintf(key, sizeof(key), "pin%d_unblock_tries", i);
++		blobmsg_add_u32(&status, key, v);
++	}
++	blobmsg_close_table(&status, t);
++	free(r);
++
++	return 0;
++}
++
++static int ub_sim_call(const char *method)
++{
++	char sim[UB_PATH_LEN];
++
++	if (ub_sim(sim, sizeof(sim)))
++		return -1;
++	return ub_invoke(sim, method, &args, NULL);
++}
++
++static int cmd_verify_pin1(char *arg)
++{
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "pin", arg);
++	return ub_sim_call("send_pin");
++}
++
++static int cmd_verify_pin2(char *arg)
++{
++	return ub_fail("--verify-pin2: not available with --uqmid (uqmid handles PIN1 only)");
++}
++
++static int ub_set_pin_protection(char *arg, int pin_id)
++{
++	bool enabled;
++
++	if (pin_id != 1)
++		return ub_fail("--set-pin2-protection: not available with --uqmid (uqmid handles PIN1 only)");
++	if (!G.pin)
++		return ub_fail("Missing argument");
++	if (!strcasecmp(arg, "disabled"))
++		enabled = false;
++	else if (!strcasecmp(arg, "enabled"))
++		enabled = true;
++	else
++		return ub_fail("Invalid value (valid: disabled, enabled)");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "pin", G.pin);
++	blobmsg_add_u8(&args, "enabled", enabled);
++	return ub_sim_call("enable_pin");
++}
++
++static int cmd_set_pin1_protection(char *arg)
++{
++	return ub_set_pin_protection(arg, 1);
++}
++
++static int cmd_set_pin2_protection(char *arg)
++{
++	return ub_set_pin_protection(arg, 2);
++}
++
++static int cmd_change_pin1(char *arg)
++{
++	if (!G.pin || !G.new_pin)
++		return ub_fail("Missing argument");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "old", G.pin);
++	blobmsg_add_string(&args, "new", G.new_pin);
++	return ub_sim_call("change_pin");
++}
++
++static int cmd_change_pin2(char *arg)
++{
++	return ub_fail("--change-pin2: not available with --uqmid (uqmid handles PIN1 only)");
++}
++
++static int cmd_unblock_pin1(char *arg)
++{
++	if (!G.puk || !G.new_pin)
++		return ub_fail("Missing argument");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "puk", G.puk);
++	blobmsg_add_string(&args, "pin", G.new_pin);
++	return ub_sim_call("send_puk");
++}
++
++static int cmd_unblock_pin2(char *arg)
++{
++	return ub_fail("--unblock-pin2: not available with --uqmid (uqmid handles PIN1 only)");
++}
++
++static int opt_pin(char *arg)
++{
++	G.pin = arg;
++	return 0;
++}
++
++static int opt_puk(char *arg)
++{
++	G.puk = arg;
++	return 0;
++}
++
++static int opt_new_pin(char *arg)
++{
++	G.new_pin = arg;
++	return 0;
++}
++
++static int ub_print_sim_string(const char *key)
++{
++	char sim[UB_PATH_LEN];
++	struct blob_attr *r;
++	const char *s;
++
++	if (ub_sim(sim, sizeof(sim)) || ub_invoke(sim, "get", NULL, &r))
++		return -1;
++	s = jstr(r, key);
++	if (s && *s)
++		blobmsg_add_string(&status, NULL, s);
++	free(r);
++
++	return 0;
++}
++
++static int cmd_get_iccid(char *arg)
++{
++	return ub_print_sim_string("sim_identifier");
++}
++
++static int cmd_get_imsi(char *arg)
++{
++	return ub_print_sim_string("imsi");
++}
++
++static int cmd_get_imei(char *arg)
++{
++	struct blob_attr *m;
++	const char *s;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++	s = jstr(m, "imei");
++	if (s && *s)
++		blobmsg_add_string(&status, NULL, s);
++	free(m);
++
++	return 0;
++}
++
++static int cmd_get_msisdn(char *arg)
++{
++	struct blob_attr *m;
++	const char *s;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++	s = jarray_first(m, "own_numbers");
++	if (s && *s)
++		blobmsg_add_string(&status, NULL, s);
++	free(m);
++
++	return 0;
++}
++
++static int cmd_get_operating_mode(char *arg)
++{
++	struct blob_attr *m;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++	blobmsg_add_string(&status, NULL, uqmi_ub_power_to_opmode(jstr(m, "power_state")));
++	free(m);
++
++	return 0;
++}
++
++static int cmd_set_operating_mode(char *arg)
++{
++	const char *power = NULL;
++	int ret = uqmi_ub_opmode_to_power(arg, &power);
++
++	if (ret == UB_MAP_INVALID)
++		return ub_fail("Invalid argument");
++	if (ret == UB_MAP_NA)
++		return ub_fail("--set-device-operating-mode %s: not available with --uqmid", arg);
++	if (ret == 1)
++		return ub_modem_simple("reset");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "state", power);
++	return ub_modem("set_power_state", &args, NULL);
++}
++
++static int cmd_reset_dms(char *arg)
++{
++	/* the reset of the modem (DMS offline + reset) */
++	return ub_modem_simple("reset");
++}
++
++static int cmd_fcc_auth(char *arg)
++{
++	return ub_modem_simple("dms_fcc_auth");
++}
++
++/*****************************************************************************/
++/* NAS */
++
++static int opt_set_network_modes(char *arg)
++{
++	const char *names[UB_MAX_MODES];
++	unsigned int n;
++	int ret = uqmi_ub_parse_network_modes(arg, names, &n);
++
++	if (ret == UB_MAP_INVALID)
++		return ub_fail("Invalid network mode");
++	if (ret == UB_MAP_NA)
++		return ub_fail("--set-network-modes %s: not available with --uqmid (no such mode)", arg);
++
++	G.modes = arg;
++	return 0;
++}
++
++static int opt_set_network_preference(char *arg)
++{
++	G.preference = arg;
++	return 0;
++}
++
++static int opt_set_roaming(char *arg)
++{
++	uint8_t pref;
++
++	if (!ext_nas_roaming_parse(arg, &pref))
++		return ub_fail("Invalid argument");
++	G.roaming = arg;
++	return 0;
++}
++
++static int opt_set_change_duration(char *arg)
++{
++	uint8_t duration;
++
++	if (!ext_nas_change_duration_parse(arg, &duration))
++		return ub_fail("Invalid argument");
++	G.duration = arg;
++	return 0;
++}
++
++static int opt_set_mcc(char *arg)
++{
++	char *err;
++
++	strtoul(arg, &err, 10);
++	if (err && *err)
++		return ub_fail("Invalid MCC value");
++	G.mcc = arg;
++	return 0;
++}
++
++static int opt_set_mnc(char *arg)
++{
++	char *err;
++
++	strtoul(arg, &err, 10);
++	if (err && *err)
++		return ub_fail("Invalid MNC value");
++	G.mnc = arg;
++	return 0;
++}
++
++static bool ub_mcc_nonzero(void)
++{
++	return G.mcc && strtoul(G.mcc, NULL, 10);
++}
++
++static int cmd_set_plmn(char *arg)
++{
++	if (!G.mcc && G.mnc)
++		return ub_fail("No MCC value");
++	if (ub_mcc_nonzero() && !G.mnc)
++		return ub_fail("No MNC value");
++
++	/* done with the other selection preferences after the commands, as the direct mode does */
++	G.plmn_pending = true;
++	return 0;
++}
++
++static int cmd_network_register(char *arg)
++{
++	/* the automatic registration; uqmid waits until the modem is registered */
++	blob_buf_init(&args, 0);
++	return ub_modem("register", &args, NULL);
++}
++
++/* the selection preferences which were given (the hidden --__set-system-selection of the direct mode) */
++static int ub_run_pending_selection(void)
++{
++	bool modes = G.modes || G.preference;
++
++	if ((modes || G.plmn_pending) && G.duration && !strcmp(G.duration, "power-cycle"))
++		return ub_fail("--network-change-duration power-cycle: not available with --uqmid");
++
++	if (modes) {
++		const char *names[UB_MAX_MODES];
++		const char *preferred = "none";
++		struct blob_attr *m = NULL, *cur_modes = NULL;
++		unsigned int n = 0, i;
++		void *a;
++
++		if (ub_modem("get", NULL, &m))
++			return -1;
++		cur_modes = jget(m, "current_modes");
++
++		if (G.modes) {
++			uqmi_ub_parse_network_modes(G.modes, names, &n);
++			/* the order preference of the modem stays if it is still allowed */
++			if (!G.preference) {
++				const char *cur = jstr(cur_modes, "preferred");
++
++				for (i = 0; cur && i < n; i++) {
++					if (!strcmp(cur, names[i]))
++						preferred = cur;
++				}
++			}
++		}
++		if (G.preference)
++			preferred = uqmi_ub_preferred_mode(G.preference);
++
++		blob_buf_init(&args, 0);
++		a = blobmsg_open_array(&args, "allowed");
++		if (G.modes) {
++			for (i = 0; i < n; i++)
++				blobmsg_add_string(&args, NULL, names[i]);
++		} else {
++			/* only the acquisition order changes: the allowed modes stay */
++			struct blob_attr *cur;
++			size_t rem;
++
++			blobmsg_for_each_attr(cur, jget(cur_modes, "allowed"), rem) {
++				if (blobmsg_type(cur) == BLOBMSG_TYPE_STRING)
++					blobmsg_add_string(&args, NULL, blobmsg_get_string(cur));
++			}
++		}
++		blobmsg_close_array(&args, a);
++		blobmsg_add_string(&args, "preferred", preferred);
++		free(m);
++
++		if (ub_modem("set_current_modes", &args, NULL))
++			return -1;
++	}
++
++	if (G.roaming) {
++		blob_buf_init(&args, 0);
++		blobmsg_add_string(&args, "roaming", G.roaming);
++		if (G.duration)
++			blobmsg_add_string(&args, "duration", G.duration);
++		if (ub_modem("nas_set_network_roaming", &args, NULL))
++			return -1;
++	}
++
++	if (G.plmn_pending) {
++		char id[16] = "";
++
++		if (ub_mcc_nonzero() && !uqmi_ub_plmn_operator_id(G.mcc, G.mnc, id, sizeof(id)))
++			return ub_fail("Invalid MCC/MNC value");
++
++		/* an empty operator id is the automatic selection */
++		blob_buf_init(&args, 0);
++		if (id[0])
++			blobmsg_add_string(&args, "operator_id", id);
++		if (ub_modem("register", &args, NULL))
++			return -1;
++	}
++
++	return 0;
++}
++
++static void ub_add_signal_tables(struct blob_attr *sig)
++{
++	struct blob_attr *cdma = jget(sig, "cdma"), *evdo = jget(sig, "evdo"), *gsm = jget(sig, "gsm");
++	struct blob_attr *umts = jget(sig, "umts"), *lte = jget(sig, "lte"), *nr = jget(sig, "nr5g");
++	bool endc = lte && nr;
++	double v;
++	void *a = NULL, *c;
++
++	/* the shape of the direct mode: one table, an array of two with EN-DC */
++	if (endc)
++		a = blobmsg_open_array(&status, NULL);
++
++	c = blobmsg_open_table(&status, NULL);
++	if (cdma) {
++		blobmsg_add_string(&status, "type", "cdma");
++		blobmsg_add_u32(&status, "rssi", jnum(cdma, "rssi", &v) ? uqmi_ub_round(v) : 0);
++		blobmsg_add_u32(&status, "ecio", jnum(cdma, "ecio", &v) ? uqmi_ub_ecio_raw(v) : 0);
++	}
++	if (evdo) {
++		blobmsg_add_string(&status, "type", "hdr");
++		blobmsg_add_u32(&status, "rssi", jnum(evdo, "rssi", &v) ? uqmi_ub_round(v) : 0);
++		blobmsg_add_u32(&status, "ecio", jnum(evdo, "ecio", &v) ? uqmi_ub_ecio_raw(v) : 0);
++		blobmsg_add_u32(&status, "io", jnum(evdo, "io", &v) ? uqmi_ub_round(v) : 0);
++	}
++	if (gsm) {
++		blobmsg_add_string(&status, "type", "gsm");
++		blobmsg_add_u32(&status, "signal", jnum(gsm, "rssi", &v) ? uqmi_ub_round(v) : 0);
++	}
++	if (umts) {
++		blobmsg_add_string(&status, "type", "wcdma");
++		blobmsg_add_u32(&status, "rssi", jnum(umts, "rssi", &v) ? uqmi_ub_round(v) : 0);
++		blobmsg_add_u32(&status, "ecio", jnum(umts, "ecio", &v) ? uqmi_ub_ecio_raw(v) : 0);
++	}
++	if (lte) {
++		blobmsg_add_string(&status, "type", "lte");
++		blobmsg_add_u32(&status, "rssi", jnum(lte, "rssi", &v) ? uqmi_ub_round(v) : 0);
++		blobmsg_add_u32(&status, "rsrq", jnum(lte, "rsrq", &v) ? uqmi_ub_round(v) : 0);
++		blobmsg_add_u32(&status, "rsrp", jnum(lte, "rsrp", &v) ? uqmi_ub_round(v) : 0);
++		blobmsg_add_double(&status, "snr", jnum(lte, "snr", &v) ? v : 0);
++	}
++	if (nr) {
++		if (endc) {
++			blobmsg_close_table(&status, c);
++			c = blobmsg_open_table(&status, NULL);
++		}
++		blobmsg_add_string(&status, "type", "5gnr");
++		if (jnum(nr, "rsrp", &v))
++			blobmsg_add_u32(&status, "rsrp", uqmi_ub_round(v));
++		if (jnum(nr, "snr", &v))
++			blobmsg_add_double(&status, "snr", v);
++		if (jnum(nr, "rsrq", &v))
++			blobmsg_add_u32(&status, "rsrq", uqmi_ub_round(v));
++	}
++	blobmsg_close_table(&status, c);
++
++	if (endc)
++		blobmsg_close_array(&status, a);
++}
++
++static bool ub_signal_has_values(struct blob_attr *sig)
++{
++	static const char *const techs[] = { "cdma", "evdo", "gsm", "umts", "lte", "nr5g" };
++	unsigned int i;
++
++	for (i = 0; i < sizeof(techs) / sizeof(techs[0]); i++) {
++		if (jget(sig, techs[i]))
++			return true;
++	}
++	return false;
++}
++
++static int cmd_get_signal_info(char *arg)
++{
++	struct blob_attr *sig = NULL;
++	bool temp = false;
++	int ret = 0;
++	unsigned int i;
++
++	if (ub_modem("signal_get", NULL, &sig))
++		return -1;
++
++	/*
++	 * uqmid only keeps the values while a refresh rate or a threshold is set: use a refresh rate for the
++	 * time of the request if there is none
++	 */
++	if (!ub_signal_has_values(sig) && !jint_or(sig, "rate", 0) && !jint_or(sig, "rssi_threshold", 0)) {
++		blob_buf_init(&args, 0);
++		blobmsg_add_u32(&args, "rate", 30);
++		if (ub_modem("signal_setup", &args, NULL)) {
++			free(sig);
++			return -1;
++		}
++		temp = true;
++		for (i = 0; i < 10; i++) {
++			usleep(500 * 1000);
++			free(sig);
++			sig = NULL;
++			if (ub_modem("signal_get", NULL, &sig)) {
++				ret = -1;
++				break;
++			}
++			if (ub_signal_has_values(sig))
++				break;
++		}
++	}
++
++	if (!ret) {
++		if (ub_signal_has_values(sig))
++			ub_add_signal_tables(sig);
++		else
++			blobmsg_close_table(&status, blobmsg_open_table(&status, NULL));
++	}
++	free(sig);
++
++	if (temp) {
++		blob_buf_init(&args, 0);
++		blobmsg_add_u32(&args, "rate", 0);
++		ub_modem("signal_setup", &args, NULL);
++	}
++
++	return ret;
++}
++
++static bool ub_registered(const char *s)
++{
++	return s && (!strncmp(s, "home", 4) || !strncmp(s, "roaming", 7));
++}
++
++static int cmd_get_serving_system(char *arg)
++{
++	struct blob_attr *m, *tech;
++	const char *reg, *code, *name;
++	unsigned int mcc, mnc;
++	size_t rem;
++	void *c, *a;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++
++	reg = jstr(m, "registration_state");
++	code = jstr(m, "operator_code");
++	name = jstr(m, "operator_name");
++
++	c = blobmsg_open_table(&status, NULL);
++	blobmsg_add_string(&status, "registration", uqmi_ub_registration_name(reg));
++	a = blobmsg_open_array(&status, "radio_interface");
++	blobmsg_for_each_attr(tech, jget(m, "access_technologies"), rem) {
++		const char *radio = blobmsg_type(tech) == BLOBMSG_TYPE_STRING ?
++				    uqmi_ub_radio_of_access_tech(blobmsg_get_string(tech)) : NULL;
++
++		if (radio)
++			blobmsg_add_string(&status, "radio", radio);
++	}
++	blobmsg_close_array(&status, a);
++	if (code && uqmi_ub_plmn_split(code, &mcc, &mnc)) {
++		blobmsg_add_u32(&status, "plmn_mcc", mcc);
++		blobmsg_add_u32(&status, "plmn_mnc", mnc);
++		if (name && *name)
++			blobmsg_add_string(&status, "plmn_description", name);
++	}
++	if (ub_registered(reg))
++		blobmsg_add_u8(&status, "roaming", !strncmp(reg, "roaming", 7));
++	blobmsg_close_table(&status, c);
++	free(m);
++
++	return 0;
++}
++
++static int cmd_get_system_info(char *arg)
++{
++	struct blob_attr *m, *tech;
++	const char *reg, *code;
++	size_t rem;
++	void *t, *c;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++
++	reg = jstr(m, "registration_state");
++	code = jstr(m, "operator_code");
++
++	/*
++	 * Reduced form: only the registration and the PLMN are known to uqmid (no domain, no cell, no tracking
++	 * area), for the radio interfaces the modem is using
++	 */
++	t = blobmsg_open_table(&status, NULL);
++	if (ub_registered(reg)) {
++		blobmsg_for_each_attr(tech, jget(m, "access_technologies"), rem) {
++			const char *radio = blobmsg_type(tech) == BLOBMSG_TYPE_STRING ?
++					    uqmi_ub_radio_of_access_tech(blobmsg_get_string(tech)) : NULL;
++			const char *key = NULL;
++			char mnc[4] = "";
++
++			if (!radio)
++				continue;
++			if (!strcmp(radio, "gsm"))
++				key = "gsm";
++			else if (!strcmp(radio, "umts"))
++				key = "wcdma";
++			else if (!strcmp(radio, "lte") || !strcmp(radio, "5gnr"))
++				key = radio;
++			if (!key)
++				continue;
++
++			c = blobmsg_open_table(&status, key);
++			blobmsg_add_string(&status, "service_status", "available");
++			blobmsg_add_string(&status, "true_service_status", "available");
++			blobmsg_add_string(&status, "roaming_status", !strncmp(reg, "roaming", 7) ? "on" : "off");
++			if (code && strlen(code) >= 5 && strlen(code) <= 6) {
++				char mcc[4];
++
++				memcpy(mcc, code, 3);
++				mcc[3] = '\0';
++				snprintf(mnc, sizeof(mnc), "%s", code + 3);
++				blobmsg_add_string(&status, "mcc", mcc);
++				blobmsg_add_string(&status, "mnc", mnc);
++			}
++			blobmsg_close_table(&status, c);
++		}
++	}
++	blobmsg_close_table(&status, t);
++	free(m);
++
++	return 0;
++}
++
++static int cmd_get_plmn(char *arg)
++{
++	struct blob_attr *m;
++	const char *code;
++	unsigned int mcc, mnc;
++	void *c;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++
++	/* the selection mode is not known to uqmid: the PLMN of the network the modem is registered to */
++	code = jstr(m, "operator_code");
++	c = blobmsg_open_table(&status, NULL);
++	if (code && uqmi_ub_plmn_split(code, &mcc, &mnc)) {
++		blobmsg_add_u32(&status, "mcc", mcc);
++		blobmsg_add_u32(&status, "mnc", mnc);
++	}
++	blobmsg_close_table(&status, c);
++	free(m);
++
++	return 0;
++}
++
++static int cmd_get_roaming(char *arg)
++{
++	struct blob_attr *r;
++	const char *s;
++
++	if (ub_modem("nas_get_network_roaming", NULL, &r))
++		return -1;
++	s = jstr(r, "roaming");
++	blobmsg_add_string(&status, NULL, s ? s : "unknown");
++	free(r);
++
++	return 0;
++}
++
++static int cmd_network_scan(char *arg)
++{
++	static const struct {
++		const char *uqmid;
++		const char *cli;
++	} stat_map[] = {
++		{ "current", "current_serving" }, { "available", "available" }, { "forbidden", "forbidden" },
++	};
++	struct blob_attr *r, *nets, *net, *tech;
++	unsigned int i, mcc, mnc;
++	size_t rem, rem2;
++	void *t, *c, *info, *stat;
++
++	if (ub_modem("scan", NULL, &r))
++		return -1;
++
++	nets = jget(r, "networks");
++	t = blobmsg_open_table(&status, NULL);
++	c = blobmsg_open_array(&status, "network_info");
++	blobmsg_for_each_attr(net, nets, rem) {
++		const char *code = jstr(net, "operator_code"), *desc = jstr(net, "operator_long"), *st = jstr(net, "status");
++
++		if (!code || !uqmi_ub_plmn_split(code, &mcc, &mnc))
++			continue;
++		info = blobmsg_open_table(&status, NULL);
++		blobmsg_add_u32(&status, "mcc", mcc);
++		blobmsg_add_u32(&status, "mnc", mnc);
++		if (desc && *desc)
++			blobmsg_add_string(&status, "description", desc);
++		stat = blobmsg_open_array(&status, "status");
++		for (i = 0; st && i < sizeof(stat_map) / sizeof(stat_map[0]); i++) {
++			if (!strcmp(st, stat_map[i].uqmid))
++				blobmsg_add_string(&status, NULL, stat_map[i].cli);
++		}
++		blobmsg_close_array(&status, stat);
++		blobmsg_close_table(&status, info);
++	}
++	blobmsg_close_array(&status, c);
++
++	c = blobmsg_open_array(&status, "radio_access_technology");
++	blobmsg_for_each_attr(net, nets, rem) {
++		const char *code = jstr(net, "operator_code");
++
++		if (!code || !uqmi_ub_plmn_split(code, &mcc, &mnc))
++			continue;
++		blobmsg_for_each_attr(tech, jget(net, "access_technology"), rem2) {
++			const char *radio = blobmsg_type(tech) == BLOBMSG_TYPE_STRING ?
++					    uqmi_ub_radio_of_access_tech(blobmsg_get_string(tech)) : NULL;
++
++			if (!radio)
++				continue;
++			info = blobmsg_open_table(&status, NULL);
++			blobmsg_add_u32(&status, "mcc", mcc);
++			blobmsg_add_u32(&status, "mnc", mnc);
++			blobmsg_add_string(&status, "radio", radio);
++			blobmsg_close_table(&status, info);
++		}
++	}
++	blobmsg_close_array(&status, c);
++	blobmsg_close_table(&status, t);
++	free(r);
++
++	return 0;
++}
++
++static int cmd_get_lte_cphy_ca_info(char *arg)
++{
++	return ub_modem_passthrough("nas_get_lte_cphy_ca_info");
++}
++
++static int cmd_get_tx_rx_info(char *arg)
++{
++	int8_t radio;
++
++	if (!ext_nas_radio_parse(arg, &radio))
++		return ub_fail("Invalid argument");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "radio", arg);
++	{
++		struct blob_attr *r;
++
++		if (ub_modem("nas_get_tx_rx_info", &args, &r))
++			return -1;
++		ub_emit_filtered(r);
++		free(r);
++	}
++	return 0;
++}
++
++static bool ub_cell_hex(struct blob_attr *cell, const char *key, uint32_t *val)
++{
++	const char *s = jstr(cell, key);
++
++	return s && uqmi_ub_parse_cell_hex(s, val);
++}
++
++static void ub_add_lte_cell(struct blob_attr *cell)
++{
++	uint32_t pci = 0;
++	double v;
++	void *c = blobmsg_open_table(&status, NULL);
++
++	ub_cell_hex(cell, "physical_ci", &pci);
++	blobmsg_add_u32(&status, "physical_cell_id", pci);
++	blobmsg_add_double(&status, "rsrq", jnum(cell, "rsrq", &v) ? v : 0);
++	blobmsg_add_double(&status, "rsrp", jnum(cell, "rsrp", &v) ? v : 0);
++	blobmsg_close_table(&status, c);
++}
++
++/*
++ * The direct mode puts the cell tables without a name into the object of the frequency, which is not valid
++ * JSON: here they are the array "cells", and the frequencies of interfrequency_lte_info are an array too.
++ */
++static int cmd_get_cell_location_info(char *arg)
++{
++	struct blob_attr *r, *cells, *cell, *other;
++	int64_t serving_earfcn = -1, earfcn;
++	uint32_t val;
++	size_t rem, rem2;
++	bool have_serving = false;
++	void *t, *c, *freq, *list;
++	double v;
++
++	if (ub_modem("get_cell_info", NULL, &r))
++		return -1;
++
++	cells = jget(r, "cells");
++	t = blobmsg_open_table(&status, NULL);
++
++	/* the serving LTE cell and the intra-frequency cells */
++	blobmsg_for_each_attr(cell, cells, rem) {
++		const char *type = jstr(cell, "cell_type");
++
++		if (type && !strcmp(type, "lte") && jbool(cell, "serving")) {
++			have_serving = true;
++			serving_earfcn = jint_or(cell, "earfcn", -1);
++			c = blobmsg_open_table(&status, "intrafrequency_lte_info");
++			if (ub_cell_hex(cell, "tac", &val))
++				blobmsg_add_u32(&status, "tracking_area_code", val);
++			if (ub_cell_hex(cell, "ci", &val)) {
++				blobmsg_add_u32(&status, "enodeb_id", val / 256);
++				blobmsg_add_u32(&status, "cell_id", val % 256);
++			}
++			if (serving_earfcn >= 0) {
++				blobmsg_add_u32(&status, "channel", serving_earfcn);
++				ext_fmt_earfcn(&status, serving_earfcn);
++			}
++			if (ub_cell_hex(cell, "physical_ci", &val))
++				blobmsg_add_u32(&status, "serving_cell_id", val);
++			list = blobmsg_open_array(&status, "cells");
++			ub_add_lte_cell(cell);
++			blobmsg_for_each_attr(other, cells, rem2) {
++				const char *ot = jstr(other, "cell_type");
++
++				if (other == cell || !ot || strcmp(ot, "lte") || jint_or(other, "earfcn", -2) != serving_earfcn)
++					continue;
++				ub_add_lte_cell(other);
++			}
++			blobmsg_close_array(&status, list);
++			blobmsg_close_table(&status, c);
++			break;
++		}
++	}
++
++	/* the cells of the other frequencies, one table per channel */
++	{
++		int64_t done[16];
++		unsigned int n_done = 0, i;
++		bool open = false;
++
++		blobmsg_for_each_attr(cell, cells, rem) {
++			const char *type = jstr(cell, "cell_type");
++			bool seen = false;
++
++			if (!type || strcmp(type, "lte") || jbool(cell, "serving"))
++				continue;
++			earfcn = jint_or(cell, "earfcn", -1);
++			if (earfcn < 0 || (have_serving && earfcn == serving_earfcn))
++				continue;
++			for (i = 0; i < n_done; i++)
++				seen |= done[i] == earfcn;
++			if (seen || n_done >= 16)
++				continue;
++			done[n_done++] = earfcn;
++
++			if (!open) {
++				c = blobmsg_open_array(&status, "interfrequency_lte_info");
++				open = true;
++			}
++			freq = blobmsg_open_table(&status, NULL);
++			blobmsg_add_u32(&status, "channel", earfcn);
++			ext_fmt_earfcn(&status, earfcn);
++			list = blobmsg_open_array(&status, "cells");
++			blobmsg_for_each_attr(other, cells, rem2) {
++				const char *ot = jstr(other, "cell_type");
++
++				if (ot && !strcmp(ot, "lte") && !jbool(other, "serving") &&
++				    jint_or(other, "earfcn", -1) == earfcn)
++					ub_add_lte_cell(other);
++			}
++			blobmsg_close_array(&status, list);
++			blobmsg_close_table(&status, freq);
++		}
++		if (open)
++			blobmsg_close_array(&status, c);
++	}
++
++	blobmsg_for_each_attr(cell, cells, rem) {
++		const char *type = jstr(cell, "cell_type");
++
++		if (!type || strcmp(type, "nr5g") || !jbool(cell, "serving"))
++			continue;
++		c = blobmsg_open_table(&status, "nr5g_cell_information");
++		if (ub_cell_hex(cell, "ci", &val)) {
++			blobmsg_add_u32(&status, "enodeb_id", val / 256);
++			blobmsg_add_u32(&status, "cell_id", val % 256);
++		}
++		if (ub_cell_hex(cell, "physical_ci", &val))
++			blobmsg_add_u32(&status, "physical_cell_id", val);
++		blobmsg_add_double(&status, "rsrq", jnum(cell, "rsrq", &v) ? v : 0);
++		blobmsg_add_double(&status, "rsrp", jnum(cell, "rsrp", &v) ? v : 0);
++		blobmsg_add_double(&status, "snr", jnum(cell, "sinr", &v) ? v : 0);
++		blobmsg_close_table(&status, c);
++		if (jint(cell, "nrarfcn", &earfcn)) {
++			c = blobmsg_open_table(&status, "nr5g_arfcn");
++			blobmsg_add_u32(&status, "arfcn", earfcn);
++			blobmsg_close_table(&status, c);
++		}
++		break;
++	}
++
++	blobmsg_close_table(&status, t);
++	free(r);
++
++	return 0;
++}
++
++/*****************************************************************************/
++/* WDS */
++
++static int opt_apn(char *arg)
++{
++	G.apn = arg;
++	return 0;
++}
++
++static int opt_auth(char *arg)
++{
++	const char *names[2];
++
++	if (uqmi_ub_auth_names(arg, names) < 0)
++		return ub_fail("Invalid auth mode (valid: pap, chap, both, none)");
++	G.auth = arg;
++	return 0;
++}
++
++static int opt_username(char *arg)
++{
++	G.username = arg;
++	return 0;
++}
++
++static int opt_password(char *arg)
++{
++	G.password = arg;
++	return 0;
++}
++
++static int opt_ip_family(char *arg)
++{
++	const char *ip_type;
++
++	if (uqmi_ub_ip_family_to_ip_type(arg, &ip_type))
++		return ub_fail("Invalid value (valid: ipv4, ipv6, unspecified)");
++	G.ip_family = arg;
++	return 0;
++}
++
++static int opt_autoconnect(char *arg)
++{
++	/* the autoconnect flag of the start network request: the bearer of uqmid has no such thing */
++	G.autoconnect = true;
++	return 0;
++}
++
++static int opt_profile(char *arg)
++{
++	G.profile = arg;
++	return 0;
++}
++
++static int opt_pdp_type(char *arg)
++{
++	const char *ip_type;
++	int ret = uqmi_ub_pdp_to_ip_type(arg, &ip_type);
++
++	if (ret == UB_MAP_NA)
++		return ub_fail("--pdp-type ppp: not available with --uqmid");
++	if (ret)
++		return ub_fail("Invalid value (valid: ipv4, ipv6, ipv4v6)");
++	G.pdp_type = ip_type;
++	return 0;
++}
++
++static int opt_no_roaming(char *arg)
++{
++	if (strcmp(arg, "true") && strcmp(arg, "false"))
++		return ub_fail("Invalid value (true or false)");
++	/* the profile of uqmid has no roaming flag: accepted and ignored */
++	G.no_roaming = arg;
++	return 0;
++}
++
++static void ub_add_auth(struct blob_buf *b, const char *key, const char *cli)
++{
++	const char *names[2];
++	int n = uqmi_ub_auth_names(cli, names), i;
++	void *a = blobmsg_open_array(b, key);
++
++	for (i = 0; i < n; i++)
++		blobmsg_add_string(b, NULL, names[i]);
++	blobmsg_close_array(b, a);
++}
++
++static int ub_enable_modem(void)
++{
++	struct blob_attr *m;
++	const char *state;
++	int ret = 0;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++	state = jstr(m, "state");
++	if (state && !strcmp(state, "disabled")) {
++		/* like the direct mode the modem is used as it is: a bearer needs an enabled modem */
++		blob_buf_init(&args, 0);
++		blobmsg_add_u8(&args, "enable", true);
++		ret = ub_modem("enable", &args, NULL);
++	} else if (!ub_state_enabled(state)) {
++		ret = ub_fail("wrong-state: modem in %s state", state ? state : "unknown");
++	}
++	free(m);
++
++	return ret;
++}
++
++static int cmd_start_network(char *arg)
++{
++	struct blob_attr *r;
++	uint32_t index, profile = 0;
++	char path[UB_PATH_LEN];
++	const char *p;
++	int ret;
++
++	if (G.autoconnect)
++		return ub_fail("--autoconnect: not available with --uqmid");
++	if (G.profile && !uqmi_ub_parse_uint(G.profile, 0xffffffffu, &profile))
++		return ub_fail("Invalid profile");
++	if (ub_enable_modem())
++		return -1;
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "apn", G.apn ? G.apn : "");
++	if (G.ip_family) {
++		const char *ip_type = "";
++
++		uqmi_ub_ip_family_to_ip_type(G.ip_family, &ip_type);
++		if (*ip_type)
++			blobmsg_add_string(&args, "ip_type", ip_type);
++	}
++	if (G.auth)
++		ub_add_auth(&args, "allowed_auth", G.auth);
++	if (G.username)
++		blobmsg_add_string(&args, "user", G.username);
++	if (G.password)
++		blobmsg_add_string(&args, "password", G.password);
++	if (G.profile)
++		blobmsg_add_u32(&args, "profile_id", profile);
++	if (ub_modem("create_bearer", &args, &r))
++		return -1;
++	p = jstr(r, "path");
++	if (!p || strlen(p) >= sizeof(path) || !uqmi_ub_path_index(p, "bearer", &index)) {
++		free(r);
++		return ub_fail("Invalid bearer path");
++	}
++	strcpy(path, p);
++	free(r);
++
++	ret = ub_invoke(path, "connect", NULL, NULL);
++	if (ret) {
++		/* nothing is left behind by a failed start */
++		blob_buf_init(&args, 0);
++		blobmsg_add_string(&args, "path", path);
++		ub_modem("delete_bearer", &args, NULL);
++		return -1;
++	}
++
++	/* the packet data handle of the direct mode is the number of the bearer object */
++	blobmsg_add_u32(&status, NULL, index);
++	return 0;
++}
++
++static int cmd_stop_network(char *arg)
++{
++	uint32_t index;
++	char path[UB_PATH_LEN];
++
++	if (!uqmi_ub_parse_uint(arg, 0xffffffffu, &index))
++		return ub_fail("Invalid handle");
++
++	/* the bearer is disconnected and removed */
++	snprintf(path, sizeof(path), "%s.bearer.%u", G.modem, index);
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "path", path);
++	return ub_modem("delete_bearer", &args, NULL);
++}
++
++/* the connected bearer (get reply in @bearer), else the first one; -1 on an error, 1 without a bearer */
++static int ub_find_bearer(struct blob_attr **bearer)
++{
++	struct blob_attr *m, *cur, *first = NULL;
++	size_t rem;
++	int ret = 1;
++
++	*bearer = NULL;
++	if (ub_modem("get", NULL, &m))
++		return -1;
++
++	blobmsg_for_each_attr(cur, jget(m, "bearers"), rem) {
++		struct blob_attr *b;
++		const char *st;
++
++		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
++			continue;
++		if (ub_invoke(blobmsg_get_string(cur), "get", NULL, &b)) {
++			free(first);
++			free(m);
++			return -1;
++		}
++		st = jstr(b, "status");
++		if (st && !strcmp(st, "connected")) {
++			free(first);
++			first = b;
++			break;
++		}
++		if (!first)
++			first = b;
++		else
++			free(b);
++	}
++	free(m);
++
++	if (first) {
++		*bearer = first;
++		ret = 0;
++	}
++	return ret;
++}
++
++static int cmd_get_packet_service_status(char *arg)
++{
++	struct blob_attr *b;
++	const char *st = "disconnected";
++	int ret = ub_find_bearer(&b);
++
++	if (ret < 0)
++		return -1;
++	if (!ret) {
++		if (jbool(b, "connected"))
++			st = jbool(b, "suspended") ? "suspended" : "connected";
++		free(b);
++	}
++	blobmsg_add_string(&status, NULL, st);
++
++	return 0;
++}
++
++static void ub_add_ipv4(const char *name, const char *addr)
++{
++	if (addr)
++		blobmsg_add_string(&status, name, addr);
++}
++
++static int cmd_get_current_settings(char *arg)
++{
++	struct blob_attr *b, *v4, *v6, *props;
++	const char *ip_type, *s;
++	int ret = ub_find_bearer(&b);
++	void *t, *c;
++	char mask[INET_ADDRSTRLEN];
++	int64_t v;
++
++	if (ret < 0)
++		return -1;
++	if (ret || !jbool(b, "connected")) {
++		free(b);
++		return ub_fail("Not connected");
++	}
++
++	props = jget(b, "properties");
++	v4 = jget(b, "ip4_config");
++	v6 = jget(b, "ip6_config");
++	ip_type = jstr(props, "ip_type");
++
++	t = blobmsg_open_table(&status, NULL);
++	if (ip_type && (!strcmp(ip_type, "ipv4") || !strcmp(ip_type, "ipv6") || !strcmp(ip_type, "ipv4v6")))
++		blobmsg_add_string(&status, "pdp-type", ip_type);
++	if (v4 || v6)
++		blobmsg_add_string(&status, "ip-family", v4 ? "ipv4" : "ipv6");
++	if (jint(v4, "mtu", &v) || jint(v6, "mtu", &v))
++		blobmsg_add_u32(&status, "mtu", v);
++
++	c = blobmsg_open_table(&status, "ipv4");
++	ub_add_ipv4("ip", jstr(v4, "address"));
++	ub_add_ipv4("dns1", jstr(v4, "dns1"));
++	ub_add_ipv4("dns2", jstr(v4, "dns2"));
++	ub_add_ipv4("gateway", jstr(v4, "gateway"));
++	if (jint(v4, "prefix", &v)) {
++		blobmsg_add_string(&status, "subnet",
++				   wds_ipv4_to_str(uqmi_ub_prefix_to_mask(v), mask, sizeof(mask)));
++	}
++	blobmsg_close_table(&status, c);
++
++	c = blobmsg_open_table(&status, "ipv6");
++	if ((s = jstr(v6, "address"))) {
++		blobmsg_add_string(&status, "ip", s);
++		blobmsg_add_u32(&status, "ip-prefix-length", jint_or(v6, "prefix", 0));
++	}
++	ub_add_ipv4("gateway", jstr(v6, "gateway"));
++	ub_add_ipv4("dns1", jstr(v6, "dns1"));
++	ub_add_ipv4("dns2", jstr(v6, "dns2"));
++	blobmsg_close_table(&status, c);
++
++	/* the domain names are not known to uqmid */
++	c = blobmsg_open_table(&status, "domain-names");
++	blobmsg_close_table(&status, c);
++	blobmsg_close_table(&status, t);
++	free(b);
++
++	return 0;
++}
++
++static int cmd_set_autoconnect_settings(char *arg)
++{
++	uint8_t st;
++
++	if (!ext_wds_autoconnect_parse(arg, &st))
++		return ub_fail("Invalid value (valid: disabled, enabled, paused)");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "status", arg);
++	return ub_modem("wds_set_autoconnect", &args, NULL);
++}
++
++/* the profile id argument "3gpp,<idx>" */
++static int ub_profile_arg(const char *arg, uint32_t *index)
++{
++	int ret = uqmi_ub_parse_profile_id(arg, index);
++
++	if (ret == UB_MAP_NA)
++		return ub_fail("3gpp2 profiles: not available with --uqmid");
++	if (ret)
++		return ub_fail("Invalid argument");
++	return 0;
++}
++
++/* a 3gpp type argument of --get-profile-list, --create-profile and --get-default-profile */
++static int ub_profile_type_arg(const char *arg)
++{
++	if (!strcasecmp(arg, "3gpp"))
++		return 0;
++	if (!strcasecmp(arg, "3gpp2"))
++		return ub_fail("3gpp2 profiles: not available with --uqmid");
++	return ub_fail("Invalid value (valid: 3gpp or 3gpp2)");
++}
++
++static int cmd_get_profile_list(char *arg)
++{
++	struct blob_attr *r, *cur;
++	size_t rem;
++	void *root, *p, *t;
++	const char *name;
++
++	if (ub_profile_type_arg(arg))
++		return -1;
++	if (ub_modem("profile_list", NULL, &r))
++		return -1;
++
++	root = blobmsg_open_table(&status, NULL);
++	p = blobmsg_open_array(&status, "profiles");
++	blobmsg_for_each_attr(cur, jget(r, "profiles"), rem) {
++		t = blobmsg_open_table(&status, NULL);
++		blobmsg_add_u32(&status, "index", jint_or(cur, "profile_id", 0));
++		name = jstr(cur, "profile_name");
++		blobmsg_add_string(&status, "name", name ? name : "");
++		blobmsg_close_table(&status, t);
++	}
++	blobmsg_close_array(&status, p);
++	blobmsg_close_table(&status, root);
++	free(r);
++
++	return 0;
++}
++
++/* the profile of the list with that index (a copy of the table), NULL if there is none */
++static int ub_get_profile(uint32_t index, struct blob_attr **profile)
++{
++	struct blob_attr *r, *cur;
++	size_t rem;
++
++	*profile = NULL;
++	if (ub_modem("profile_list", NULL, &r))
++		return -1;
++	blobmsg_for_each_attr(cur, jget(r, "profiles"), rem) {
++		if ((uint32_t) jint_or(cur, "profile_id", -1) == index) {
++			*profile = blob_memdup(cur);
++			break;
++		}
++	}
++	free(r);
++
++	return 0;
++}
++
++static int cmd_get_profile_settings(char *arg)
++{
++	struct blob_attr *p;
++	uint32_t index;
++	const char *s;
++	void *t;
++
++	if (ub_profile_arg(arg, &index) || ub_get_profile(index, &p))
++		return -1;
++	if (!p)
++		return ub_fail("Profile %u not found", index);
++
++	t = blobmsg_open_table(&status, NULL);
++	s = jstr(p, "apn");
++	blobmsg_add_string(&status, "apn", s ? s : "");
++	s = jstr(p, "ip_type");
++	if (s && (!strcmp(s, "ipv4") || !strcmp(s, "ipv6") || !strcmp(s, "ipv4v6")))
++		blobmsg_add_string(&status, "pdp-type", s);
++	s = jstr(p, "user");
++	blobmsg_add_string(&status, "username", s ? s : "");
++	s = jstr(p, "password");
++	blobmsg_add_string(&status, "password", s ? s : "");
++	blobmsg_add_string(&status, "auth",
++			   uqmi_ub_auth_cli_name(jarray_has(p, "allowed_auth", "pap"), jarray_has(p, "allowed_auth", "chap")));
++	/* the profile of uqmid has no roaming flag and no APN disabled flag */
++	blobmsg_add_u8(&status, "no-roaming", false);
++	blobmsg_add_u8(&status, "apn-disabled", false);
++	blobmsg_close_table(&status, t);
++	free(p);
++
++	return 0;
++}
++
++/* the "profile" argument of profile_set: the current profile (if any) with the given options on top */
++static void ub_add_profile(struct blob_buf *b, struct blob_attr *cur, bool has_id, uint32_t index)
++{
++	struct blob_attr *attr;
++	size_t rem;
++	void *t = blobmsg_open_table(b, "profile");
++
++	if (cur) {
++		blobmsg_for_each_attr(attr, cur, rem) {
++			const char *n = blobmsg_name(attr);
++
++			if (!strcmp(n, "profile_id") ||
++			    (G.apn && !strcmp(n, "apn")) ||
++			    (G.pdp_type && !strcmp(n, "ip_type")) ||
++			    (G.auth && !strcmp(n, "allowed_auth")) ||
++			    (G.username && !strcmp(n, "user")) ||
++			    (G.password && !strcmp(n, "password")))
++				continue;
++			blobmsg_add_blob(b, attr);
++		}
++	}
++	if (has_id)
++		blobmsg_add_u32(b, "profile_id", index);
++	if (G.apn)
++		blobmsg_add_string(b, "apn", G.apn);
++	if (G.pdp_type)
++		blobmsg_add_string(b, "ip_type", G.pdp_type);
++	if (G.auth)
++		ub_add_auth(b, "allowed_auth", G.auth);
++	if (G.username)
++		blobmsg_add_string(b, "user", G.username);
++	if (G.password)
++		blobmsg_add_string(b, "password", G.password);
++	blobmsg_close_table(b, t);
++}
++
++static int cmd_create_profile(char *arg)
++{
++	struct blob_attr *r;
++	void *t;
++
++	if (ub_profile_type_arg(arg))
++		return -1;
++
++	blob_buf_init(&args, 0);
++	ub_add_profile(&args, NULL, false, 0);
++	if (ub_modem("profile_set", &args, &r))
++		return -1;
++
++	if (jint_or(jget(r, "profile"), "profile_id", -1) >= 0) {
++		t = blobmsg_open_table(&status, NULL);
++		blobmsg_add_u32(&status, "created-profile", jint_or(jget(r, "profile"), "profile_id", 0));
++		blobmsg_close_table(&status, t);
++	}
++	free(r);
++
++	return 0;
++}
++
++static int cmd_modify_profile(char *arg)
++{
++	struct blob_attr *cur;
++	uint32_t index;
++
++	if (ub_profile_arg(arg, &index) || ub_get_profile(index, &cur))
++		return -1;
++	if (!cur)
++		return ub_fail("Profile %u not found", index);
++
++	/* profile_set replaces the profile: the fields which were not given stay as they are */
++	blob_buf_init(&args, 0);
++	ub_add_profile(&args, cur, true, index);
++	free(cur);
++
++	return ub_modem("profile_set", &args, NULL);
++}
++
++static int cmd_delete_profile(char *arg)
++{
++	uint32_t index;
++
++	if (ub_profile_arg(arg, &index))
++		return -1;
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_u32(&args, "profile_id", index);
++	return ub_modem("profile_delete", &args, NULL);
++}
++
++static int cmd_get_default_profile(char *arg)
++{
++	struct blob_attr *m;
++	int64_t id;
++	void *t;
++	int ret = 0;
++
++	if (ub_profile_type_arg(arg) || ub_modem("get", NULL, &m))
++		return -1;
++
++	/* the default (attach) profile of the modem: the profile of the initial EPS bearer settings */
++	if (jint(jget(m, "initial_eps_bearer_settings"), "profile_id", &id)) {
++		t = blobmsg_open_table(&status, NULL);
++		blobmsg_add_u32(&status, "default-profile", id);
++		blobmsg_close_table(&status, t);
++	} else {
++		ret = ub_fail("Default profile not known");
++	}
++	free(m);
++
++	return ret;
++}
++
++/*****************************************************************************/
++/* WDA */
++
++static int opt_wda_dl_proto(char *arg)
++{
++	int proto;
++
++	if (!wds_name_to_val(ext_wda_aggregation_names, ext_wda_aggregation_names_n, arg, true, &proto))
++		return ub_fail("Invalid protocol (valid: tlp, qc-cm, mbim, rndis, qmap, qmapv5");
++	G.dl_proto = arg;
++	G.dl_proto_set = true;
++	return 0;
++}
++
++static int opt_wda_ul_proto(char *arg)
++{
++	int proto;
++
++	if (!wds_name_to_val(ext_wda_aggregation_names, ext_wda_aggregation_names_n, arg, true, &proto))
++		return ub_fail("Invalid protocol (valid: tlp, qc-cm, mbim, rndis, qmap, qmapv5");
++	G.ul_proto = arg;
++	G.ul_proto_set = true;
++	return 0;
++}
++
++static int opt_wda_dl_count(char *arg)
++{
++	G.dl_count = strtoul(arg, NULL, 10);
++	return 0;
++}
++
++static int opt_wda_dl_size(char *arg)
++{
++	G.dl_size = strtoul(arg, NULL, 10);
++	return 0;
++}
++
++static int opt_wda_ul_count(char *arg)
++{
++	G.ul_count = strtoul(arg, NULL, 10);
++	return 0;
++}
++
++static int opt_wda_ul_size(char *arg)
++{
++	G.ul_size = strtoul(arg, NULL, 10);
++	return 0;
++}
++
++static int opt_wda_flow_control(char *arg)
++{
++	uint32_t val = strtoul(arg, NULL, 10);
++
++	if (val != 0 && val != 1)
++		return ub_fail("Invalid value (valid: 0, 1)");
++	G.flow_control = val;
++	return 0;
++}
++
++static int cmd_wda_set_data_format(char *arg)
++{
++	int link;
++
++	if (!wds_name_to_val(ext_wda_link_layer_names, ext_wda_link_layer_names_n, arg, true, &link))
++		return ub_fail("Invalid auth mode (valid: 802.3, raw-ip)");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "type", arg);
++	if (G.dl_proto_set)
++		blobmsg_add_string(&args, "dl_aggregation_protocol", G.dl_proto);
++	blobmsg_add_u32(&args, "dl_datagram_max_count", G.dl_count);
++	blobmsg_add_u32(&args, "dl_datagram_max_size", G.dl_size);
++	if (G.ul_proto_set)
++		blobmsg_add_string(&args, "ul_aggregation_protocol", G.ul_proto);
++	blobmsg_add_u32(&args, "ul_datagram_max_count", G.ul_count);
++	blobmsg_add_u32(&args, "ul_datagram_max_size", G.ul_size);
++	if (G.flow_control >= 0)
++		blobmsg_add_u32(&args, "flow_control", G.flow_control);
++	return ub_modem("wda_set_data_format", &args, NULL);
++}
++
++static int cmd_wda_get_data_format(char *arg)
++{
++	return ub_modem_passthrough("wda_get_data_format");
++}
++
++/*****************************************************************************/
++/* UIM */
++
++static int opt_uim_slot(char *arg)
++{
++	char *err;
++	int value = strtoul(arg, &err, 10);
++
++	if ((err && *err) || value < 1 || value > 2)
++		return ub_fail("Invalid UIM-Slot value. Allowed: [1,2]");
++	G.uim_slot = value;
++	return 0;
++}
++
++static int opt_uim_channel_id(char *arg)
++{
++	char *err;
++	int value = strtoul(arg, &err, 10);
++
++	if ((err && *err) || value < 1 || value > 4)
++		return ub_fail("Invalid Channel-ID value. Allowed: [1,2,3,4]");
++	G.channel_id = value;
++	return 0;
++}
++
++static int cmd_uim_get_sim_state(char *arg)
++{
++	return ub_modem_passthrough("uim_get_sim_state");
++}
++
++static int ub_uim_slot_call(const char *method)
++{
++	if (!G.uim_slot)
++		return ub_fail("UIM-Slot not set. Use --uim-slot <slot> to set it.");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_u32(&args, "slot", G.uim_slot);
++	return ub_modem(method, &args, NULL);
++}
++
++static int cmd_uim_power_off(char *arg)
++{
++	return ub_uim_slot_call("uim_power_off");
++}
++
++static int cmd_uim_power_on(char *arg)
++{
++	return ub_uim_slot_call("uim_power_on");
++}
++
++static int cmd_uim_open_logical_channel(char *arg)
++{
++	uint8_t aid[16];
++	unsigned int len;
++	struct blob_attr *r;
++
++	if (!G.uim_slot)
++		return ub_fail("UIM-Slot not set");
++	if (!ext_hex_parse(arg, aid, sizeof(aid), &len))
++		return ub_fail("Invalid AID argument");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "aid", arg);
++	blobmsg_add_u32(&args, "slot", G.uim_slot);
++	if (ub_modem("uim_channel_open", &args, &r))
++		return -1;
++	ub_emit_filtered(r);
++	free(r);
++
++	return 0;
++}
++
++static int cmd_uim_close_logical_channel(char *arg)
++{
++	if (!G.uim_slot)
++		return ub_fail("UIM-Slot not set. Use --uim-slot <slot> to set it.");
++	if (G.channel_id < 1)
++		return ub_fail("Invalid channel-id set.");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_u32(&args, "channel_id", G.channel_id);
++	blobmsg_add_u32(&args, "slot", G.uim_slot);
++	return ub_modem("uim_channel_close", &args, NULL);
++}
++
++static int cmd_uim_send_apdu(char *arg)
++{
++	uint8_t apdu[1024];
++	unsigned int len;
++	struct blob_attr *r;
++
++	if (!G.uim_slot)
++		return ub_fail("UIM-Slot not set. Use --uim-slot <slot> to set it.");
++	if (!ext_hex_parse(arg, apdu, sizeof(apdu), &len))
++		return ub_fail("Invalid APDU argument");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "apdu", arg);
++	/* without --uim-channel-id the direct mode sends the channel id 255 (-1) */
++	blobmsg_add_u32(&args, "channel_id", G.channel_id < 0 ? 255 : G.channel_id);
++	blobmsg_add_u32(&args, "slot", G.uim_slot);
++	if (ub_modem("uim_apdu_send", &args, &r))
++		return -1;
++	ub_emit_filtered(r);
++	free(r);
++
++	return 0;
++}
++
++/*****************************************************************************/
++/* WMS */
++
++static int opt_storage(char *arg)
++{
++	if (strcmp(arg, "sim") && strcmp(arg, "me"))
++		return ub_fail("Invalid value (sim or me)");
++	G.storage = arg;
++	return 0;
++}
++
++/* the sms object of the message with that storage index in the selected storage; false if none */
++static int ub_find_sms(uint32_t index, char *path, size_t len)
++{
++	struct blob_attr *r, *cur;
++	const char *want = uqmi_ub_storage_name(G.storage);
++	size_t rem;
++	int ret = 1;
++
++	if (ub_modem("messaging_list", NULL, &r))
++		return -1;
++	blobmsg_for_each_attr(cur, jget(r, "messages"), rem) {
++		struct blob_attr *s, *idx;
++		const char *st;
++		size_t rem2;
++
++		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING || ub_invoke(blobmsg_get_string(cur), "get", NULL, &s))
++			continue;
++		st = jstr(s, "storage");
++		if (st && !strcmp(st, want)) {
++			blobmsg_for_each_attr(idx, jget(s, "indices"), rem2) {
++				if (blobmsg_type(idx) == BLOBMSG_TYPE_INT32 && blobmsg_get_u32(idx) == index &&
++				    strlen(blobmsg_get_string(cur)) < len) {
++					strcpy(path, blobmsg_get_string(cur));
++					ret = 0;
++				}
++			}
++		}
++		free(s);
++		if (!ret)
++			break;
++	}
++	free(r);
++
++	return ret;
++}
++
++static int cmd_list_messages(char *arg)
++{
++	struct blob_attr *r, *cur;
++	const char *want = uqmi_ub_storage_name(G.storage);
++	size_t rem;
++	void *a;
++
++	if (ub_modem("messaging_list", NULL, &r))
++		return -1;
++
++	/* the received messages of the storage (the direct mode lists the unread ones) */
++	a = blobmsg_open_array(&status, NULL);
++	blobmsg_for_each_attr(cur, jget(r, "messages"), rem) {
++		struct blob_attr *s, *idx;
++		const char *st, *type;
++		size_t rem2;
++
++		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING || ub_invoke(blobmsg_get_string(cur), "get", NULL, &s))
++			continue;
++		st = jstr(s, "storage");
++		type = jstr(s, "pdu_type");
++		if (st && !strcmp(st, want) && type && !strcmp(type, "deliver")) {
++			blobmsg_for_each_attr(idx, jget(s, "indices"), rem2) {
++				if (blobmsg_type(idx) == BLOBMSG_TYPE_INT32)
++					blobmsg_add_u32(&status, NULL, blobmsg_get_u32(idx));
++			}
++		}
++		free(s);
++	}
++	blobmsg_close_array(&status, a);
++	free(r);
++
++	return 0;
++}
++
++static int ub_message_id(const char *arg, uint32_t *id)
++{
++	char *err;
++
++	*id = strtoul(arg, &err, 10);
++	if (err && *err)
++		return ub_fail("Invalid message ID");
++	return 0;
++}
++
++static int cmd_delete_message(char *arg)
++{
++	char path[UB_PATH_LEN];
++	uint32_t id;
++	int ret;
++
++	if (ub_message_id(arg, &id))
++		return -1;
++	ret = ub_find_sms(id, path, sizeof(path));
++	if (ret < 0)
++		return -1;
++	if (ret)
++		return ub_fail("Message %u not found", id);
++
++	/* all the parts of a multipart message are deleted with it */
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "path", path);
++	return ub_modem("messaging_delete", &args, NULL);
++}
++
++static int ub_raw_message(char *arg, struct blob_attr **r)
++{
++	uint32_t id;
++
++	if (ub_message_id(arg, &id))
++		return -1;
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "storage", G.storage);
++	blobmsg_add_u32(&args, "index", id);
++	return ub_modem("wms_get_raw_message", &args, r);
++}
++
++static int cmd_get_message(char *arg)
++{
++	uint8_t pdu[SMS_PDU_MAX];
++	struct blob_attr *r;
++	char err[128] = "";
++	const char *s;
++	int len;
++	void *c;
++
++	if (ub_raw_message(arg, &r))
++		return -1;
++	s = jstr(r, "data");
++	len = s ? uqmi_ub_parse_raw_sms(s, pdu, sizeof(pdu)) : -1;
++	if (len < 0) {
++		free(r);
++		return ub_fail("Invalid message data");
++	}
++
++	/* the raw message is decoded like in the direct mode */
++	c = blobmsg_open_table(&status, NULL);
++	if (uqmi_sms_pdu_to_blob(&status, pdu, len, err, sizeof(err)))
++		fprintf(stderr, "There was an error reading message: %s\n", err);
++	blobmsg_close_table(&status, c);
++	free(r);
++
++	return 0;
++}
++
++static int cmd_get_raw_message(char *arg)
++{
++	struct blob_attr *r;
++	const char *s;
++
++	if (ub_raw_message(arg, &r))
++		return -1;
++	s = jstr(r, "data");
++	if (s)
++		blobmsg_add_string(&status, NULL, s);
++	free(r);
++
++	return 0;
++}
++
++static int opt_send_smsc(char *arg)
++{
++	G.send_smsc = arg;
++	return 0;
++}
++
++static int opt_send_target(char *arg)
++{
++	G.send_target = arg;
++	return 0;
++}
++
++static int opt_send_flash(char *arg)
++{
++	G.send_flash = true;
++	return 0;
++}
++
++static int cmd_send_message(char *arg)
++{
++	struct blob_attr *r;
++	char path[UB_PATH_LEN];
++	const char *p;
++	int ret;
++
++	if (!G.send_target || !*G.send_target)
++		return ub_fail("Missing argument");
++	if ((G.send_smsc && strlen(G.send_smsc) > 16) || strlen(G.send_target) > 16)
++		return ub_fail("Argument too long");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "number", G.send_target);
++	blobmsg_add_string(&args, "text", arg);
++	if (G.send_smsc && *G.send_smsc)
++		blobmsg_add_string(&args, "smsc", G.send_smsc);
++	/* the direct mode: the longest relative validity (63 weeks) and the class 0 of a flash message */
++	blobmsg_add_u32(&args, "validity", 63 * 7 * 24 * 60);
++	if (G.send_flash)
++		blobmsg_add_u32(&args, "class", 0);
++	if (ub_modem("messaging_create", &args, &r))
++		return -1;
++	p = jstr(r, "path");
++	if (!p || strlen(p) >= sizeof(path)) {
++		free(r);
++		return ub_fail("Invalid message path");
++	}
++	strcpy(path, p);
++	free(r);
++
++	ret = ub_invoke(path, "send", NULL, NULL);
++
++	/* the sent message is not kept (the direct mode does not store it either) */
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "path", path);
++	if (ub_modem("messaging_delete", &args, NULL) && !ret)
++		ret = -1;
++
++	return ret;
++}
++
++/*****************************************************************************/
++/* VOICE */
++
++static bool ub_call_id(const char *arg, uint32_t *id)
++{
++	if (uqmi_ub_parse_uint(arg, 0xff, id))
++		return true;
++	ub_fail("Invalid call ID");
++	return false;
++}
++
++/* the call object with the QMI call id; 1 if there is none */
++static int ub_find_call(uint32_t id, char *path, size_t len)
++{
++	struct blob_attr *r, *cur;
++	size_t rem;
++	int ret = 1;
++
++	if (ub_modem("voice_list_calls", NULL, &r))
++		return -1;
++	blobmsg_for_each_attr(cur, jget(r, "calls"), rem) {
++		struct blob_attr *c;
++		const char *st;
++
++		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING || ub_invoke(blobmsg_get_string(cur), "get", NULL, &c))
++			continue;
++		st = jstr(c, "state");
++		if ((uint32_t) jint_or(c, "qmi_call_id", 0) == id && st && strcmp(st, "terminated") &&
++		    strlen(blobmsg_get_string(cur)) < len) {
++			strcpy(path, blobmsg_get_string(cur));
++			ret = 0;
++		}
++		free(c);
++		if (!ret)
++			break;
++	}
++	free(r);
++
++	return ret;
++}
++
++static int cmd_voice_dial(char *arg)
++{
++	struct blob_attr *r, *c;
++	char path[UB_PATH_LEN];
++	const char *p;
++	int64_t id;
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "number", arg);
++	if (ub_modem("voice_create_call", &args, &r))
++		return -1;
++	p = jstr(r, "path");
++	if (!p || strlen(p) >= sizeof(path)) {
++		free(r);
++		return ub_fail("Invalid call path");
++	}
++	strcpy(path, p);
++	free(r);
++
++	if (ub_invoke(path, "start", NULL, NULL)) {
++		blob_buf_init(&args, 0);
++		blobmsg_add_string(&args, "path", path);
++		ub_modem("voice_delete_call", &args, NULL);
++		return -1;
++	}
++	if (ub_invoke(path, "get", NULL, &c))
++		return -1;
++	if (!jint(c, "qmi_call_id", &id) || !id) {
++		free(c);
++		return ub_fail("The call has no call id");
++	}
++	free(c);
++
++	blobmsg_add_u32(&status, NULL, id);
++	return 0;
++}
++
++static int ub_call_method(char *arg, const char *method)
++{
++	char path[UB_PATH_LEN];
++	uint32_t id;
++	int ret;
++
++	if (!ub_call_id(arg, &id))
++		return -1;
++	ret = ub_find_call(id, path, sizeof(path));
++	if (ret < 0)
++		return -1;
++	if (ret)
++		return ub_fail("Call %u not found", id);
++
++	return ub_invoke(path, method, NULL, NULL);
++}
++
++static int cmd_voice_end_call(char *arg)
++{
++	return ub_call_method(arg, "hangup");
++}
++
++static int cmd_voice_answer_call(char *arg)
++{
++	return ub_call_method(arg, "accept");
++}
++
++/* the "calls" of --voice-get-all-call-info and of the indications of the active calls */
++static int ub_add_calls(struct blob_buf *b, const char *name)
++{
++	struct blob_attr *m, *r, *cur;
++	const char *mode;
++	size_t rem;
++	void *a, *t;
++
++	if (ub_modem("get", NULL, &m))
++		return -1;
++	mode = uqmi_ub_call_mode_name(jarray_first(m, "access_technologies"));
++	if (ub_modem("voice_list_calls", NULL, &r)) {
++		free(m);
++		return -1;
++	}
++
++	a = blobmsg_open_array(b, name);
++	blobmsg_for_each_attr(cur, jget(r, "calls"), rem) {
++		struct blob_attr *c;
++		const char *st, *num;
++		int64_t id;
++
++		if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING || ub_invoke(blobmsg_get_string(cur), "get", NULL, &c))
++			continue;
++		st = jstr(c, "state");
++		/* the calls the modem knows: the ended ones have no call id any more */
++		if (jint(c, "qmi_call_id", &id) && id && st && strcmp(st, "terminated") && strcmp(st, "unknown")) {
++			t = blobmsg_open_table(b, NULL);
++			blobmsg_add_u32(b, "id", id);
++			blobmsg_add_string(b, "state", uqmi_ub_call_state_name(st));
++			blobmsg_add_string(b, "type", "voice");
++			blobmsg_add_string(b, "direction", uqmi_ub_call_direction_name(jstr(c, "direction")));
++			blobmsg_add_string(b, "mode", mode);
++			num = jstr(c, "number");
++			if (num && *num)
++				blobmsg_add_string(b, "number", num);
++			blobmsg_close_table(b, t);
++		}
++		free(c);
++	}
++	blobmsg_close_array(b, a);
++	free(r);
++	free(m);
++
++	return 0;
++}
++
++static int cmd_voice_get_all_call_info(char *arg)
++{
++	return ub_add_calls(&status, NULL);
++}
++
++static int cmd_voice_burst_dtmf(char *arg)
++{
++	uint32_t id;
++	const char *digits = uqmi_ub_split_call_arg(arg, &id);
++
++	if (!digits)
++		return ub_fail("Invalid argument (expected <id>,<value>)");
++	if (strlen(digits) > 0xff)
++		return ub_fail("Too many digits");
++
++	blob_buf_init(&args, 0);
++	blobmsg_add_u32(&args, "call_id", id);
++	blobmsg_add_string(&args, "digits", digits);
++	return ub_modem("voice_burst_dtmf", &args, NULL);
++}
++
++static int cmd_voice_start_dtmf(char *arg)
++{
++	char path[UB_PATH_LEN];
++	uint32_t id;
++	const char *digit = uqmi_ub_split_call_arg(arg, &id);
++	int ret;
++
++	if (!digit)
++		return ub_fail("Invalid argument (expected <id>,<value>)");
++	if (digit[1])
++		return ub_fail("Only a single digit is allowed");
++	ret = ub_find_call(id, path, sizeof(path));
++	if (ret < 0)
++		return -1;
++	if (ret)
++		return ub_fail("Call %u not found", id);
++
++	/* uqmid sends the digit for 500 ms (start and stop continuous DTMF) */
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "dtmf", digit);
++	return ub_invoke(path, "send_dtmf", &args, NULL);
++}
++
++static int cmd_voice_stop_dtmf(char *arg)
++{
++	uint32_t id;
++	char path[UB_PATH_LEN];
++	int ret;
++
++	if (!ub_call_id(arg, &id))
++		return -1;
++	ret = ub_find_call(id, path, sizeof(path));
++	if (ret < 0)
++		return -1;
++	if (ret)
++		return ub_fail("Call %u not found", id);
++
++	/* the tone of send_dtmf is stopped by uqmid itself */
++	return 0;
++}
++
++static struct ubus_subscriber ub_subscriber;
++static struct uloop_timeout ub_ind_timer;
++static struct blob_buf ub_ind_buf;
++
++/* one line per call state change: {"event":"all_call_status","calls":[...]} */
++static void ub_ind_timer_cb(struct uloop_timeout *t)
++{
++	char *str;
++
++	blob_buf_init(&ub_ind_buf, 0);
++	blobmsg_add_string(&ub_ind_buf, "event", "all_call_status");
++	if (ub_add_calls(&ub_ind_buf, "calls"))
++		return;
++
++	str = blobmsg_format_json_indent(ub_ind_buf.head, true, -1);
++	if (str) {
++		printf("%s\n", str);
++		fflush(stdout);
++		free(str);
++	}
++}
++
++static int ub_notify_cb(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req,
++			const char *method, struct blob_attr *msg)
++{
++	if (!strncmp(method, "voice.call_", 11))
++		uloop_timeout_set(&ub_ind_timer, 20);
++	return 0;
++}
++
++static int cmd_voice_indications(char *arg)
++{
++	ub_ind_timer.cb = ub_ind_timer_cb;
++	ub_subscriber.cb = ub_notify_cb;
++
++	ubus_add_uloop(G.ctx);
++	if (ubus_register_subscriber(G.ctx, &ub_subscriber))
++		return ub_fail("Failed to register the ubus subscriber");
++	if (ubus_subscribe(G.ctx, &ub_subscriber, G.modem_id))
++		return ub_fail("Failed to subscribe to %s", G.modem);
++
++	/* runs until -t expires or SIGINT / SIGTERM */
++	uloop_run();
++	uloop_timeout_cancel(&ub_ind_timer);
++	blob_buf_free(&ub_ind_buf);
++
++	return 0;
++}
++
++/*****************************************************************************/
++/* PDC */
++
++static int opt_pdc_config_type(char *arg)
++{
++	uint32_t type;
++
++	if (!pdc_type_parse(arg, &type))
++		return ub_fail("Invalid value (valid: software, platform)");
++	G.pdc_type = arg;
++	return 0;
++}
++
++static int ub_pdc_call(const char *method, const char *id, const char *file, struct blob_attr **r)
++{
++	blob_buf_init(&args, 0);
++	blobmsg_add_string(&args, "type", G.pdc_type);
++	if (id)
++		blobmsg_add_string(&args, "id", id);
++	if (file)
++		blobmsg_add_string(&args, "file", file);
++	return ub_modem(method, &args, r);
++}
++
++static int cmd_pdc_list_configs(char *arg)
++{
++	struct blob_attr *r, *cur;
++	const char *type;
++	size_t rem;
++	void *a, *c;
++
++	if (ub_pdc_call("pdc_list", NULL, NULL, &r))
++		return -1;
++
++	type = jstr(r, "type");
++	a = blobmsg_open_array(&status, NULL);
++	blobmsg_for_each_attr(cur, jget(r, "configs"), rem) {
++		const char *s;
++		uint32_t version = 0;
++
++		c = blobmsg_open_table(&status, NULL);
++		blobmsg_add_string(&status, "type", type ? type : G.pdc_type);
++		s = jstr(cur, "id");
++		if (s)
++			blobmsg_add_string(&status, "id", s);
++		s = jstr(cur, "description");
++		blobmsg_add_string(&status, "description", s ? s : "");
++		uqmi_ub_parse_hex(jstr(cur, "version"), &version);
++		blobmsg_printf(&status, "version", "0x%x", version);
++		blobmsg_add_u32(&status, "size", jint_or(cur, "total_size", 0));
++		blobmsg_add_u8(&status, "active", jbool(cur, "active"));
++		blobmsg_add_u8(&status, "pending", jbool(cur, "pending"));
++		blobmsg_close_table(&status, c);
++	}
++	blobmsg_close_array(&status, a);
++	free(r);
++
++	return 0;
++}
++
++static int cmd_pdc_get_selected_config(char *arg)
++{
++	struct blob_attr *r;
++	const char *s;
++	void *c;
++
++	if (ub_pdc_call("pdc_selected", NULL, NULL, &r))
++		return -1;
++
++	c = blobmsg_open_table(&status, NULL);
++	s = jstr(r, "type");
++	blobmsg_add_string(&status, "type", s ? s : G.pdc_type);
++	if ((s = jstr(r, "active")))
++		blobmsg_add_string(&status, "active", s);
++	if ((s = jstr(r, "pending")))
++		blobmsg_add_string(&status, "pending", s);
++	blobmsg_close_table(&status, c);
++	free(r);
++
++	return 0;
++}
++
++static int ub_pdc_emit(struct blob_attr *r, const char *const *keys)
++{
++	void *c = blobmsg_open_table(&status, NULL);
++	int64_t v;
++	const char *s;
++	unsigned int i;
++
++	for (i = 0; keys[i]; i++) {
++		if (!strcmp(keys[i], "size")) {
++			if (jint(r, "size", &v))
++				blobmsg_add_u32(&status, "size", v);
++		} else if ((s = jstr(r, keys[i]))) {
++			blobmsg_add_string(&status, keys[i], s);
++		}
++	}
++	blobmsg_close_table(&status, c);
++
++	return 0;
++}
++
++static int cmd_pdc_load_config(char *arg)
++{
++	static const char *const keys[] = { "type", "id", "size", NULL };
++	char real[PATH_MAX];
++	struct blob_attr *r;
++
++	/* uqmid reads the file: its working directory is another one */
++	if (!realpath(arg, real))
++		return ub_fail("Failed to open file");
++	if (ub_pdc_call("pdc_load", NULL, real, &r))
++		return -1;
++	ub_pdc_emit(r, keys);
++	free(r);
++
++	return 0;
++}
++
++static int cmd_pdc_activate_config(char *arg)
++{
++	static const char *const keys[] = { "type", "id", "status", NULL };
++	uint8_t id[PDC_ID_MAX];
++	unsigned int n;
++	struct blob_attr *r;
++
++	if (!pdc_id_parse(arg, id, &n))
++		return ub_fail("Invalid configuration ID (expected hex string)");
++	if (ub_pdc_call("pdc_activate", arg, NULL, &r))
++		return -1;
++	ub_pdc_emit(r, keys);
++	free(r);
++
++	return 0;
++}
++
++static int cmd_pdc_deactivate_config(char *arg)
++{
++	static const char *const keys[] = { "type", "status", NULL };
++	struct blob_attr *r;
++
++	if (ub_pdc_call("pdc_deactivate", NULL, NULL, &r))
++		return -1;
++	ub_pdc_emit(r, keys);
++	free(r);
++
++	return 0;
++}
++
++static int cmd_pdc_delete_config(char *arg)
++{
++	uint8_t id[PDC_ID_MAX];
++	unsigned int n;
++
++	if (!pdc_id_parse(arg, id, &n))
++		return ub_fail("Invalid configuration ID (expected hex string)");
++	return ub_pdc_call("pdc_delete", arg, NULL, NULL);
++}
++
++/*****************************************************************************/
++/* the commands */
++
++struct ub_cmd {
++	const char *name;
++	int (*fn)(char *arg);
++};
++
++/* the names of the options and commands of the command line; not in the table: not available */
++static const struct ub_cmd ub_cmds[] = {
++	{ "get-versions", cmd_get_versions },
++	{ "set-data-format", cmd_ctl_set_data_format },
++
++	{ "start-network", cmd_start_network },
++	{ "apn", opt_apn },
++	{ "auth-type", opt_auth },
++	{ "username", opt_username },
++	{ "password", opt_password },
++	{ "ip-family", opt_ip_family },
++	{ "autoconnect", opt_autoconnect },
++	{ "profile", opt_profile },
++	{ "stop-network", cmd_stop_network },
++	{ "get-data-status", cmd_get_packet_service_status },
++	{ "set-autoconnect", cmd_set_autoconnect_settings },
++	{ "get-profile-settings", cmd_get_profile_settings },
++	{ "get-default-profile", cmd_get_default_profile },
++	{ "get-profile-list", cmd_get_profile_list },
++	{ "create-profile", cmd_create_profile },
++	{ "modify-profile", cmd_modify_profile },
++	{ "delete-profile", cmd_delete_profile },
++	{ "pdp-type", opt_pdp_type },
++	{ "no-roaming", opt_no_roaming },
++	{ "get-current-settings", cmd_get_current_settings },
++
++	{ "get-capabilities", cmd_dms_get_capabilities },
++	{ "get-pin-status", cmd_dms_get_pin_status },
++	{ "verify-pin1", cmd_verify_pin1 },
++	{ "verify-pin2", cmd_verify_pin2 },
++	{ "set-pin1-protection", cmd_set_pin1_protection },
++	{ "set-pin2-protection", cmd_set_pin2_protection },
++	{ "pin", opt_pin },
++	{ "change-pin1", cmd_change_pin1 },
++	{ "change-pin2", cmd_change_pin2 },
++	{ "unblock-pin1", cmd_unblock_pin1 },
++	{ "unblock-pin2", cmd_unblock_pin2 },
++	{ "puk", opt_puk },
++	{ "new-pin", opt_new_pin },
++	{ "get-iccid", cmd_get_iccid },
++	{ "get-imsi", cmd_get_imsi },
++	{ "get-imei", cmd_get_imei },
++	{ "get-msisdn", cmd_get_msisdn },
++	{ "get-device-operating-mode", cmd_get_operating_mode },
++	{ "set-device-operating-mode", cmd_set_operating_mode },
++	{ "reset-dms", cmd_reset_dms },
++	{ "fcc-auth", cmd_fcc_auth },
++
++	{ "set-network-modes", opt_set_network_modes },
++	{ "network-register", cmd_network_register },
++	{ "set-plmn", cmd_set_plmn },
++	{ "get-plmn", cmd_get_plmn },
++	{ "mcc", opt_set_mcc },
++	{ "mnc", opt_set_mnc },
++	{ "network-scan", cmd_network_scan },
++	{ "get-signal-info", cmd_get_signal_info },
++	{ "get-serving-system", cmd_get_serving_system },
++	{ "set-network-preference", opt_set_network_preference },
++	{ "set-network-roaming", opt_set_roaming },
++	{ "get-network-roaming", cmd_get_roaming },
++	{ "network-change-duration", opt_set_change_duration },
++	{ "get-system-info", cmd_get_system_info },
++	{ "get-lte-cphy-ca-info", cmd_get_lte_cphy_ca_info },
++	{ "get-cell-location-info", cmd_get_cell_location_info },
++	{ "get-tx-rx-info", cmd_get_tx_rx_info },
++
++	{ "storage", opt_storage },
++	{ "list-messages", cmd_list_messages },
++	{ "delete-message", cmd_delete_message },
++	{ "get-message", cmd_get_message },
++	{ "get-raw-message", cmd_get_raw_message },
++	{ "send-message-smsc", opt_send_smsc },
++	{ "send-message-target", opt_send_target },
++	{ "send-message-flash", opt_send_flash },
++	{ "send-message", cmd_send_message },
++
++	{ "wda-set-data-format", cmd_wda_set_data_format },
++	{ "dl-aggregation-protocol", opt_wda_dl_proto },
++	{ "dl-datagram-max-count", opt_wda_dl_count },
++	{ "dl-datagram-max-size", opt_wda_dl_size },
++	{ "ul-aggregation-protocol", opt_wda_ul_proto },
++	{ "ul-datagram-max-count", opt_wda_ul_count },
++	{ "ul-datagram-max-size", opt_wda_ul_size },
++	{ "flow-control", opt_wda_flow_control },
++	{ "wda-get-data-format", cmd_wda_get_data_format },
++
++	{ "uim-slot", opt_uim_slot },
++	{ "uim-verify-pin1", cmd_verify_pin1 },
++	{ "uim-verify-pin2", cmd_verify_pin2 },
++	{ "uim-get-sim-state", cmd_uim_get_sim_state },
++	{ "uim-power-off", cmd_uim_power_off },
++	{ "uim-power-on", cmd_uim_power_on },
++	{ "uim-channel-id", opt_uim_channel_id },
++	{ "uim-channel-open", cmd_uim_open_logical_channel },
++	{ "uim-channel-close", cmd_uim_close_logical_channel },
++	{ "uim-apdu-send", cmd_uim_send_apdu },
++
++	{ "pdc-config-type", opt_pdc_config_type },
++	{ "pdc-list-configs", cmd_pdc_list_configs },
++	{ "pdc-get-selected-config", cmd_pdc_get_selected_config },
++	{ "pdc-load-config", cmd_pdc_load_config },
++	{ "pdc-activate-config", cmd_pdc_activate_config },
++	{ "pdc-deactivate-config", cmd_pdc_deactivate_config },
++	{ "pdc-delete-config", cmd_pdc_delete_config },
++
++	{ "voice-dial", cmd_voice_dial },
++	{ "voice-end-call", cmd_voice_end_call },
++	{ "voice-answer-call", cmd_voice_answer_call },
++	{ "voice-get-all-call-info", cmd_voice_get_all_call_info },
++	{ "voice-burst-dtmf", cmd_voice_burst_dtmf },
++	{ "voice-start-dtmf", cmd_voice_start_dtmf },
++	{ "voice-stop-dtmf", cmd_voice_stop_dtmf },
++	{ "voice-indications", cmd_voice_indications },
++};
++
++static const struct ub_cmd *ub_find_cmd(const char *name)
++{
++	unsigned int i;
++
++	for (i = 0; i < sizeof(ub_cmds) / sizeof(ub_cmds[0]); i++) {
++		if (!strcmp(ub_cmds[i].name, name))
++			return &ub_cmds[i];
++	}
++	return NULL;
++}
++
++/* the options first, then the commands, like the direct mode; stops at the first failure */
++static bool ub_run_commands(bool options)
++{
++	const struct uqmi_cmd *cmds;
++	unsigned int n, i;
++
++	cmds = uqmi_get_commands(&n);
++	for (i = 0; i < n; i++) {
++		const struct ub_cmd *cmd;
++		bool is_option = cmds[i].handler->type == CMD_TYPE_OPTION;
++		int res;
++
++		if (is_option != options)
++			continue;
++
++		blob_buf_init(&status, 0);
++		cmd = ub_find_cmd(cmds[i].handler->name);
++		res = cmd ? cmd->fn(cmds[i].arg) : ub_na(cmds[i].handler->name);
++		ub_print_result();
++		if (res)
++			return false;
++	}
++
++	return true;
++}
++
++int uqmi_ubus_run(const char *device, long timeout_ms)
++{
++	bool ok;
++
++	G.timeout = timeout_ms > 0 && timeout_ms < INT_MAX ? timeout_ms : UB_DEFAULT_TIMEOUT_MS;
++
++	G.ctx = ubus_connect(NULL);
++	if (!G.ctx) {
++		fprintf(stderr, "Failed to connect to ubus\n");
++		return 2;
++	}
++
++	if (ub_select_modem(device)) {
++		ub_print_result();
++		ubus_free(G.ctx);
++		return 2;
++	}
++	if (ubus_lookup_id(G.ctx, G.modem, &G.modem_id)) {
++		ub_fail("%s: object not found", G.modem);
++		ub_print_result();
++		ubus_free(G.ctx);
++		return 2;
++	}
++
++	ok = ub_run_commands(true) && ub_run_commands(false);
++	if (ok) {
++		blob_buf_init(&status, 0);
++		ok = !ub_run_pending_selection();
++		ub_print_result();
++	}
++
++	blob_buf_free(&args);
++	ubus_free(G.ctx);
++
++	return ok ? 0 : -1;
++}
+--- /dev/null
++++ b/uqmi/ubus-client.h
+@@ -0,0 +1,21 @@
++/*
++ * uqmi --uqmid: talk to the uqmid daemon over ubus instead of opening the device
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#ifndef __UQMI_UBUS_CLIENT_H
++#define __UQMI_UBUS_CLIENT_H
++
++/*
++ * Runs the commands collected with uqmi_add_command() against the modem of uqmid which belongs to @device
++ * (the /dev node, the port name or the physdev; NULL: the only modem). @timeout_ms is the timeout of a ubus
++ * call (0: the default). Returns the exit code of uqmi: 0 if all commands worked, -1 if one failed, 2 if uqmid
++ * or the modem was not found.
++ */
++int uqmi_ubus_run(const char *device, long timeout_ms);
++
++#endif /* __UQMI_UBUS_CLIENT_H */
+--- /dev/null
++++ b/uqmi/ubus-map.c
+@@ -0,0 +1,465 @@
++/* uqmi --uqmid: argument and value translation, see ubus-map.h */
++
++#include <ctype.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++
++#include "ubus-map.h"
++
++bool uqmi_ub_device_match(const char *device, const char *node, const char *port, const char *physdev)
++{
++	const char *base;
++
++	if (!device || !*device)
++		return false;
++
++	base = strrchr(device, '/');
++	base = base ? base + 1 : device;
++
++	if (node && *node) {
++		const char *nbase = strrchr(node, '/');
++
++		if (!strcmp(device, node) || !strcmp(device, nbase ? nbase + 1 : node))
++			return true;
++	}
++	if (port && *port && (!strcmp(device, port) || !strcmp(base, port)))
++		return true;
++	if (physdev && *physdev && !strcmp(device, physdev))
++		return true;
++
++	return false;
++}
++
++bool uqmi_ub_path_index(const char *path, const char *kind, uint32_t *index)
++{
++	char key[32];
++	const char *p;
++	char *end;
++	unsigned long val;
++
++	if (!path)
++		return false;
++	snprintf(key, sizeof(key), ".%s.", kind);
++	p = strstr(path, key);
++	if (!p)
++		return false;
++	p += strlen(key);
++	if (!isdigit((unsigned char) *p))
++		return false;
++	val = strtoul(p, &end, 10);
++	if (*end)
++		return false;
++	*index = val;
++	return true;
++}
++
++int uqmi_ub_opmode_to_power(const char *mode, const char **power)
++{
++	if (!strcmp(mode, "online")) {
++		*power = "on";
++		return 0;
++	}
++	if (!strcmp(mode, "low_power") || !strcmp(mode, "persistent_low_power") ||
++	    !strcmp(mode, "mode_only_low_power")) {
++		*power = "low";
++		return 0;
++	}
++	if (!strcmp(mode, "offline")) {
++		*power = "off";
++		return 0;
++	}
++	if (!strcmp(mode, "reset"))
++		return 1;
++	if (!strcmp(mode, "factory_test") || !strcmp(mode, "shutting_down"))
++		return UB_MAP_NA;
++
++	return UB_MAP_INVALID;
++}
++
++const char *uqmi_ub_power_to_opmode(const char *power)
++{
++	if (power) {
++		if (!strcmp(power, "on"))
++			return "online";
++		if (!strcmp(power, "low"))
++			return "low_power";
++		if (!strcmp(power, "off"))
++			return "offline";
++	}
++	return "unknown";
++}
++
++int uqmi_ub_parse_network_modes(const char *arg, const char *names[UB_MAX_MODES], unsigned int *n)
++{
++	static const struct {
++		const char *cli;
++		const char *nick;
++	} modes[] = {
++		{ "gsm", "2g" },
++		{ "umts", "3g" },
++		{ "lte", "4g" },
++		{ "5gnr", "5g" },
++	};
++	char buf[128], *word, *save = NULL;
++	unsigned int i, cnt = 0;
++	bool any = false;
++
++	if (strlen(arg) >= sizeof(buf))
++		return UB_MAP_INVALID;
++	strcpy(buf, arg);
++
++	for (word = strtok_r(buf, ",", &save); word; word = strtok_r(NULL, ",", &save)) {
++		bool found = false;
++
++		if (!strcmp(word, "all")) {
++			any = true;
++			continue;
++		}
++		if (!strcmp(word, "cdma") || !strcmp(word, "td-scdma"))
++			return UB_MAP_NA;
++
++		for (i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
++			unsigned int j;
++			bool dup = false;
++
++			if (strcmp(word, modes[i].cli))
++				continue;
++			found = true;
++			for (j = 0; j < cnt; j++)
++				dup |= !strcmp(names[j], modes[i].nick);
++			if (!dup && cnt < UB_MAX_MODES)
++				names[cnt++] = modes[i].nick;
++		}
++		if (!found)
++			return UB_MAP_INVALID;
++	}
++
++	if (any) {
++		names[0] = "any";
++		cnt = 1;
++	}
++	if (!cnt)
++		return UB_MAP_INVALID;
++
++	*n = cnt;
++	return 0;
++}
++
++const char *uqmi_ub_preferred_mode(const char *pref)
++{
++	if (pref && !strcmp(pref, "gsm"))
++		return "2g";
++	if (pref && !strcmp(pref, "wcdma"))
++		return "3g";
++	return "none";
++}
++
++int uqmi_ub_auth_names(const char *arg, const char *names[2])
++{
++	if (!strcasecmp(arg, "none")) {
++		names[0] = "none";
++		return 1;
++	}
++	if (!strcasecmp(arg, "pap")) {
++		names[0] = "pap";
++		return 1;
++	}
++	if (!strcasecmp(arg, "chap")) {
++		names[0] = "chap";
++		return 1;
++	}
++	if (!strcasecmp(arg, "both")) {
++		names[0] = "pap";
++		names[1] = "chap";
++		return 2;
++	}
++	return UB_MAP_INVALID;
++}
++
++const char *uqmi_ub_auth_cli_name(bool pap, bool chap)
++{
++	if (pap && chap)
++		return "both";
++	if (pap)
++		return "pap";
++	if (chap)
++		return "chap";
++	return "none";
++}
++
++int uqmi_ub_pdp_to_ip_type(const char *arg, const char **ip_type)
++{
++	if (!strcasecmp(arg, "ipv4") || !strcasecmp(arg, "ipv6") || !strcasecmp(arg, "ipv4v6")) {
++		static const char *names[] = { "ipv4", "ipv6", "ipv4v6" };
++
++		*ip_type = names[!strcasecmp(arg, "ipv6") ? 1 : !strcasecmp(arg, "ipv4v6") ? 2 : 0];
++		return 0;
++	}
++	if (!strcasecmp(arg, "ppp"))
++		return UB_MAP_NA;
++	return UB_MAP_INVALID;
++}
++
++int uqmi_ub_ip_family_to_ip_type(const char *arg, const char **ip_type)
++{
++	if (!strcasecmp(arg, "ipv4"))
++		*ip_type = "ipv4";
++	else if (!strcasecmp(arg, "ipv6"))
++		*ip_type = "ipv6";
++	else if (!strcasecmp(arg, "unspecified"))
++		*ip_type = "";
++	else
++		return UB_MAP_INVALID;
++	return 0;
++}
++
++static bool all_digits(const char *s)
++{
++	if (!*s)
++		return false;
++	for (; *s; s++) {
++		if (!isdigit((unsigned char) *s))
++			return false;
++	}
++	return true;
++}
++
++bool uqmi_ub_plmn_operator_id(const char *mcc, const char *mnc, char *buf, size_t len)
++{
++	size_t ml, nl;
++	int n;
++
++	if (!mcc || !mnc || !all_digits(mcc) || !all_digits(mnc))
++		return false;
++	ml = strlen(mcc);
++	nl = strlen(mnc);
++	if (ml > 3 || nl > 3)
++		return false;
++
++	/* the CLI takes numbers: "1" is MNC 01, a third digit is kept */
++	n = snprintf(buf, len, "%0*lu%0*lu", 3, strtoul(mcc, NULL, 10), nl == 3 ? 3 : 2, strtoul(mnc, NULL, 10));
++	return n > 0 && (size_t) n < len;
++}
++
++bool uqmi_ub_plmn_split(const char *code, unsigned int *mcc, unsigned int *mnc)
++{
++	size_t len;
++	char buf[4];
++
++	if (!code || !all_digits(code))
++		return false;
++	len = strlen(code);
++	if (len != 5 && len != 6)
++		return false;
++
++	memcpy(buf, code, 3);
++	buf[3] = '\0';
++	*mcc = strtoul(buf, NULL, 10);
++	*mnc = strtoul(code + 3, NULL, 10);
++	return true;
++}
++
++const char *uqmi_ub_radio_of_access_tech(const char *tech)
++{
++	static const struct {
++		const char *tech;
++		const char *radio;
++	} map[] = {
++		{ "gsm", "gsm" }, { "gprs", "gsm" }, { "edge", "gsm" },
++		{ "umts", "umts" }, { "hsdpa", "umts" }, { "hsupa", "umts" }, { "hspa", "umts" }, { "hspa-plus", "umts" },
++		{ "lte", "lte" },
++		{ "5gnr", "5gnr" },
++		{ "1xrtt", "cdma-1x" },
++		{ "evdo0", "cdma-1x_evdo" }, { "evdoa", "cdma-1x_evdo" }, { "evdob", "cdma-1x_evdo" },
++	};
++	unsigned int i;
++
++	if (!tech)
++		return NULL;
++	for (i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
++		if (!strcmp(tech, map[i].tech))
++			return map[i].radio;
++	}
++	return NULL;
++}
++
++const char *uqmi_ub_registration_name(const char *s)
++{
++	if (!s)
++		return "unknown";
++	if (!strcmp(s, "home") || !strcmp(s, "roaming") || !strncmp(s, "home-", 5) || !strncmp(s, "roaming-", 8))
++		return "registered";
++	if (!strcmp(s, "searching"))
++		return "searching";
++	if (!strcmp(s, "idle") || !strcmp(s, "emergency-only") || !strcmp(s, "attached-rlos"))
++		return "not_registered";
++	if (!strcmp(s, "denied"))
++		return "registering_denied";
++	return "unknown";
++}
++
++const char *uqmi_ub_storage_name(const char *arg)
++{
++	if (arg && !strcmp(arg, "sim"))
++		return "sm";
++	if (arg && !strcmp(arg, "me"))
++		return "me";
++	return NULL;
++}
++
++const char *uqmi_ub_call_state_name(const char *state)
++{
++	static const struct {
++		const char *uqmid;
++		const char *cli;
++	} map[] = {
++		{ "dialing", "origination" }, { "ringing-out", "alerting" }, { "ringing-in", "incoming" },
++		{ "active", "conversation" }, { "held", "hold" }, { "waiting", "waiting" },
++		{ "terminated", "end" },
++	};
++	unsigned int i;
++
++	for (i = 0; state && i < sizeof(map) / sizeof(map[0]); i++) {
++		if (!strcmp(state, map[i].uqmid))
++			return map[i].cli;
++	}
++	return "unknown";
++}
++
++const char *uqmi_ub_call_direction_name(const char *direction)
++{
++	if (direction && !strcmp(direction, "incoming"))
++		return "mt";
++	if (direction && !strcmp(direction, "outgoing"))
++		return "mo";
++	return "unknown";
++}
++
++const char *uqmi_ub_call_mode_name(const char *tech)
++{
++	const char *radio = uqmi_ub_radio_of_access_tech(tech);
++
++	if (!radio)
++		return "unknown";
++	if (!strcmp(radio, "gsm"))
++		return "gsm";
++	if (!strcmp(radio, "umts"))
++		return "umts";
++	if (!strcmp(radio, "lte"))
++		return "lte";
++	if (!strncmp(radio, "cdma", 4))
++		return "cdma";
++	return "unknown";
++}
++
++bool uqmi_ub_parse_uint(const char *str, uint32_t max, uint32_t *val)
++{
++	unsigned long v;
++	char *end;
++
++	if (!str || !*str || !isdigit((unsigned char) *str))
++		return false;
++	v = strtoul(str, &end, 0);
++	if (*end || v > max)
++		return false;
++	*val = v;
++	return true;
++}
++
++int uqmi_ub_parse_profile_id(const char *arg, uint32_t *index)
++{
++	char type[8];
++	const char *comma = strchr(arg, ',');
++	size_t n;
++
++	if (!comma)
++		return UB_MAP_INVALID;
++	n = comma - arg;
++	if (n >= sizeof(type))
++		return UB_MAP_INVALID;
++	memcpy(type, arg, n);
++	type[n] = '\0';
++
++	if (!uqmi_ub_parse_uint(comma + 1, 0xffffffffu, index))
++		return UB_MAP_INVALID;
++	if (!strcasecmp(type, "3gpp"))
++		return 0;
++	if (!strcasecmp(type, "3gpp2"))
++		return UB_MAP_NA;
++	return UB_MAP_INVALID;
++}
++
++const char *uqmi_ub_split_call_arg(const char *arg, uint32_t *id)
++{
++	char *end;
++	unsigned long val;
++
++	if (!arg[0])
++		return NULL;
++	val = strtoul(arg, &end, 0);
++	if (end == arg || val > 0xff || *end != ',' || !end[1])
++		return NULL;
++	*id = val;
++	return end + 1;
++}
++
++bool uqmi_ub_parse_hex(const char *str, uint32_t *val)
++{
++	unsigned long v;
++	char *end;
++
++	if (!str || !isxdigit((unsigned char) *str))
++		return false;
++	v = strtoul(str, &end, 16);
++	if (*end || v > 0xffffffffu)
++		return false;
++	*val = v;
++	return true;
++}
++
++uint32_t uqmi_ub_prefix_to_mask(unsigned int prefix)
++{
++	if (prefix == 0)
++		return 0;
++	if (prefix >= 32)
++		return 0xffffffffu;
++	return 0xffffffffu << (32 - prefix);
++}
++
++int32_t uqmi_ub_round(double val)
++{
++	return (int32_t) lround(val);
++}
++
++int32_t uqmi_ub_ecio_raw(double ecio_db)
++{
++	return (int32_t) lround(ecio_db * -2.0);
++}
++
++int uqmi_ub_parse_raw_sms(const char *str, uint8_t *out, size_t max)
++{
++	size_t n = 0;
++
++	while (*str) {
++		unsigned int v;
++		int used;
++
++		if (*str == ' ') {
++			str++;
++			continue;
++		}
++		if (n >= max || sscanf(str, "%2x%n", &v, &used) != 1 || used != 2)
++			return -1;
++		out[n++] = v;
++		str += 2;
++	}
++	return n;
++}
++
++bool uqmi_ub_parse_cell_hex(const char *str, uint32_t *val)
++{
++	return uqmi_ub_parse_hex(str, val);
++}
+--- /dev/null
++++ b/uqmi/ubus-map.h
+@@ -0,0 +1,109 @@
++/*
++ * uqmi --uqmid: pure helpers which translate the arguments and values of the uqmi command line to those of
++ * the uqmid ubus API and back. No libubus / blobmsg here (host tests: common/test/test_ubus_map.c).
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ */
++
++#ifndef __UQMI_UBUS_MAP_H
++#define __UQMI_UBUS_MAP_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* the result of a translation: 0 ok, UB_MAP_INVALID a bad argument, UB_MAP_NA no uqmid counterpart */
++#define UB_MAP_INVALID	(-1)
++#define UB_MAP_NA	(-2)
++
++/*
++ * The device option of a modem (same matching as the netifd protocol uqmid.sh): the /dev node, the port name or
++ * the physdev, with or without the /dev/ prefix. Any of the strings may be NULL.
++ */
++bool uqmi_ub_device_match(const char *device, const char *node, const char *port, const char *physdev);
++
++/* "uqmid.modem.<N>[.bearer.<M>]" -> M / N (false if it does not have that form) */
++bool uqmi_ub_path_index(const char *path, const char *kind, uint32_t *index);
++
++/*
++ * --set-device-operating-mode: "online" -> power state "on", "low_power", "persistent_low_power" and
++ * "mode_only_low_power" -> "low", "offline" -> "off" (return 0, *power set); "reset" -> 1 (the reset method);
++ * "factory_test" / "shutting_down" -> UB_MAP_NA; anything else UB_MAP_INVALID.
++ */
++int uqmi_ub_opmode_to_power(const char *mode, const char **power);
++
++/* --get-device-operating-mode: power state "on" / "low" / "off" -> "online" / "low_power" / "offline", else "unknown" */
++const char *uqmi_ub_power_to_opmode(const char *power);
++
++/*
++ * --set-network-modes "gsm,umts,lte,5gnr,all": the nicks of the uqmid modes (2g, 3g, 4g, 5g, any). 0 ok,
++ * UB_MAP_INVALID (the CLI's "Invalid network mode"), UB_MAP_NA for cdma and td-scdma (no uqmid mode).
++ */
++#define UB_MAX_MODES	8
++int uqmi_ub_parse_network_modes(const char *arg, const char *names[UB_MAX_MODES], unsigned int *n);
++
++/* --set-network-preference: "gsm" -> "2g", "wcdma" -> "3g", anything else "none" */
++const char *uqmi_ub_preferred_mode(const char *pref);
++
++/* --auth-type "none", "pap", "chap", "both" -> the nicks of allowed_auth; returns the count, UB_MAP_INVALID */
++int uqmi_ub_auth_names(const char *arg, const char *names[2]);
++
++/* allowed_auth (which of the nicks are present) -> "none", "pap", "chap", "both" */
++const char *uqmi_ub_auth_cli_name(bool pap, bool chap);
++
++/* --pdp-type "ipv4", "ipv6", "ipv4v6" -> ip_type; "ppp" is UB_MAP_NA, anything else UB_MAP_INVALID */
++int uqmi_ub_pdp_to_ip_type(const char *arg, const char **ip_type);
++
++/* --ip-family "ipv4", "ipv6", "unspecified" -> ip_type ("" for unspecified: not sent) */
++int uqmi_ub_ip_family_to_ip_type(const char *arg, const char **ip_type);
++
++/* "<mcc>" and "<mnc>" (digits) -> "<MCC><MNC>" for register (MCC 3 digits, MNC 2 or 3 digits, as given) */
++bool uqmi_ub_plmn_operator_id(const char *mcc, const char *mnc, char *buf, size_t len);
++
++/* "45006" / "310260" -> mcc 450 / mnc 6 (the numbers the CLI prints) */
++bool uqmi_ub_plmn_split(const char *code, unsigned int *mcc, unsigned int *mnc);
++
++/* access technology nick of uqmid (gsm, gprs, edge, umts, hsdpa, ..., lte, 5gnr) -> NAS radio interface of the CLI, NULL if none */
++const char *uqmi_ub_radio_of_access_tech(const char *tech);
++
++/* MM registration state -> the "registration" of --get-serving-system ("registered", "not_registered", ...) */
++const char *uqmi_ub_registration_name(const char *mm_state);
++
++/* the --storage option: "sim" -> "sm", "me" -> "me", else NULL */
++const char *uqmi_ub_storage_name(const char *arg);
++
++/* the state / direction / mode of a call of the CLI (--voice-get-all-call-info) from the uqmid ones */
++const char *uqmi_ub_call_state_name(const char *state);
++const char *uqmi_ub_call_direction_name(const char *direction);
++const char *uqmi_ub_call_mode_name(const char *access_tech);
++
++/* "3gpp,<idx>" -> idx; UB_MAP_NA for "3gpp2" */
++int uqmi_ub_parse_profile_id(const char *arg, uint32_t *index);
++
++/* "<id>,<value>" of the DTMF commands: id (0..255) and the value (NULL if empty or malformed) */
++const char *uqmi_ub_split_call_arg(const char *arg, uint32_t *id);
++
++/* a number (decimal, or hex with 0x) without trailing garbage, 0..max */
++bool uqmi_ub_parse_uint(const char *str, uint32_t max, uint32_t *val);
++
++/* hex string "%08X" of a PDC version -> number (as printed by the CLI with "0x%x") */
++bool uqmi_ub_parse_hex(const char *str, uint32_t *val);
++
++/* prefix length -> IPv4 netmask (host order) */
++uint32_t uqmi_ub_prefix_to_mask(unsigned int prefix);
++
++/* units of the CLI from the values of uqmid (the signal values are doubles) */
++int32_t uqmi_ub_round(double val);
++/* uqmid: dB = raw * -0.5 */
++int32_t uqmi_ub_ecio_raw(double ecio_db);
++
++/* the raw SMS of wms_get_raw_message: "xx xx xx" -> bytes; returns the count, -1 if malformed */
++int uqmi_ub_parse_raw_sms(const char *str, uint8_t *out, size_t max);
++
++/* a cell / area id of get_cell_info (upper-case hex without leading zeros) -> number */
++bool uqmi_ub_parse_cell_hex(const char *str, uint32_t *val);
++
++#endif /* __UQMI_UBUS_MAP_H */
+--- a/uqmi/uqmi.c
++++ b/uqmi/uqmi.c
+@@ -31,8 +31,10 @@
+ 
+ #include "uqmi.h"
+ #include "commands.h"
++#include "ubus-client.h"
+ 
+ static const char *device;
++static bool uqmid_mode;
+ 
+ #define CMD_OPT(_arg) (-2 - _arg)
+ 
+@@ -45,6 +47,7 @@ static const struct option uqmi_getopt[] = {
+ 	{ "release-client-id", required_argument, NULL, 'r' },
+ 	{ "mbim",  no_argument, NULL, 'm' },
+ 	{ "timeout", required_argument, NULL, 't' },
++	{ "uqmid", no_argument, NULL, 'u' },
+ 	{ NULL, 0, NULL, 0 }
+ };
+ #undef __uqmi_command
+@@ -54,11 +57,13 @@ static int usage(const char *progname)
+ 	fprintf(stderr, "Usage: %s <options|actions>\n"
+ 		"Options:\n"
+ 		"  --single, -s:                     Print output as a single line (for scripts)\n"
+-		"  --device=NAME, -d NAME:           Set device name to NAME (required)\n"
++		"  --device=NAME, -d NAME:           Set device name to NAME (required, except with --uqmid)\n"
+ 		"  --keep-client-id <name>:          Keep Client ID for service <name>\n"
+ 		"  --release-client-id <name>:       Release Client ID after exiting\n"
+ 		"  --mbim, -m                        NAME is an MBIM device with EXT_QMUX support\n"
+ 		"  --timeout, -t                     response timeout in msecs\n"
++		"  --uqmid, -u:                      Do not open the device, use the uqmid daemon over ubus\n"
++		"                                    (--device selects the modem, default: the only one)\n"
+ 		"\n"
+ 		"Services:                           dms, nas, pds, wds, wms, wda, uim, pdc, voice\n"
+ 		"\n"
+@@ -118,6 +123,8 @@ struct uloop_timeout request_timeout = { .cb = _request_timeout_handler, };
+ int main(int argc, char **argv)
+ {
+ 	static struct qmi_dev dev;
++	bool client_opts = false;
++	long timeout_ms = 0;
+ 	int ch, ret;
+ 
+ 	uloop_init();
+@@ -134,9 +141,11 @@ int main(int argc, char **argv)
+ 
+ 		switch(ch) {
+ 		case 'r':
++			client_opts = true;
+ 			release_client_id(&dev, optarg);
+ 			break;
+ 		case 'k':
++			client_opts = true;
+ 			keep_client_id(&dev, optarg);
+ 			break;
+ 		case 'd':
+@@ -146,16 +155,29 @@ int main(int argc, char **argv)
+ 			single_line = true;
+ 			break;
+ 		case 'm':
++			client_opts = true;
+ 			dev.is_mbim = true;
+ 			break;
+ 		case 't':
+-			uloop_timeout_set(&request_timeout, atol(optarg));
++			timeout_ms = atol(optarg);
++			uloop_timeout_set(&request_timeout, timeout_ms);
++			break;
++		case 'u':
++			uqmid_mode = true;
+ 			break;
+ 		default:
+ 			return usage(argv[0]);
+ 		}
+ 	}
+ 
++	if (uqmid_mode) {
++		if (client_opts) {
++			printf("\"--keep-client-id, --release-client-id and --mbim: not available with --uqmid\"\n");
++			return -1;
++		}
++		return uqmi_ubus_run(device, timeout_ms);
++	}
++
+ 	if (!device) {
+ 		fprintf(stderr, "No device given\n");
+ 		return usage(argv[0]);
