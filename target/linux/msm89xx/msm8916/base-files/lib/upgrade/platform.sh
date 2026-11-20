@@ -7,7 +7,8 @@ platform_check_image() {
 
 platform_do_upgrade() {
 	case "$(board_name)" in
-	generic,ufi-esim)
+	generic,ufi-esim|\
+	yiming,uz801-v3)
 		CI_KERNPART="boot"
 		CI_ROOTPART="userdata"
 		emmc_do_upgrade "$1"
@@ -20,7 +21,8 @@ platform_do_upgrade() {
 
 platform_copy_config() {
 	case "$(board_name)" in
-	generic,ufi-esim)
+	generic,ufi-esim|\
+	yiming,uz801-v3)
 		emmc_copy_config
 		;;
 	esac

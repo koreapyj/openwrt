@@ -64,7 +64,8 @@ migrate_iface() {
 }
 
 case "$(board_name)" in
-generic,ufi-esim)
+generic,ufi-esim|\
+yiming,uz801-v3)
 	config_load network
 	config_foreach migrate_iface interface
 	[ "$CHANGED" = "1" ] && uci -q commit network

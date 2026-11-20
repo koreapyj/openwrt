@@ -24,7 +24,7 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/dragonboard-410c-bootloader-emmc-linux-$(PKG_VERSION
 
 include $(INCLUDE_DIR)/package.mk
 
-MSM8916_BOOT_DEVICES:=generic_ufi-esim
+MSM8916_BOOT_DEVICES:=generic_ufi-esim yiming_uz801-v3
 
 define Package/db410c-bootloader
   SECTION:=boot

@@ -26,7 +26,8 @@ mount_firmware_partitions() {
 	local dev
 
 	case "$(board_name)" in
-	generic,ufi-esim)
+	generic,ufi-esim|\
+	yiming,uz801-v3)
 		dev="$(find_mmc_part modem)"
 		[ -b "$dev" ] && mount -t vfat -o ro,noatime,shortname=lower "$dev" /lib/firmware/modem ||
 			echo "- cannot mount modem firmware partition -"

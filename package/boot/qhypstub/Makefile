@@ -20,7 +20,7 @@ PKG_FLAGS:=nonshared
 
 include $(INCLUDE_DIR)/package.mk
 
-MSM8916_BOOT_DEVICES:=generic_ufi-esim
+MSM8916_BOOT_DEVICES:=generic_ufi-esim yiming_uz801-v3
 
 define Package/qhypstub
   SECTION:=boot

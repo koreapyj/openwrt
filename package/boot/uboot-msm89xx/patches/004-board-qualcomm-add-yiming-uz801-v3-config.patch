@@ -1,0 +1,58 @@
+board: qualcomm: add Yiming UZ801 v3 OpenWrt configuration
+
+Add the per-device config fragment and the U-Boot devicetree additions
+(fixed 512 MiB /memory, UART pinctrl for all boot stages, ramoops
+reserved-memory node) for the Yiming UZ801 v3 4G modem stick, on top of
+the common msm89xx-openwrt.config. The devicetree itself is upstream
+(qcom/msm8916-yiming-uz801v3).
+
+---
+--- /dev/null
++++ b/arch/arm/dts/msm8916-yiming-uz801v3-u-boot.dtsi
+@@ -0,0 +1,41 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * U-Boot additions for the 512 MiB MSM8916 "UFI" 4G modem sticks.
++ */
++
++/ {
++	/*
++	 * When running as a first-stage bootloader the memory is not filled in
++	 * automatically (U-Boot does not probe SMEM for it). Both sticks ship
++	 * 512 MiB of RAM ("msm8916_32_512" stock firmware).
++	 */
++	memory@80000000 {
++		reg = <0 0x80000000 0 0x20000000>;
++	};
++
++	reserved-memory {
++		/*
++		 * Linux panic log (pstore/ramoops, same node as in the kernel
++		 * devicetree), checked by "pstore check" in the boot script.
++		 * Kept away from U-Boot's lmb so that nothing overwrites it.
++		 * 0x8c100000 is in the 5 MiB hole between the mpss region of
++		 * the SoC devicetree (ends at 0x8bd00000) and the lowest
++		 * allocation of U-Boot's own windows (starts at 0x8c200000).
++		 */
++		ramoops@8c100000 {
++			compatible = "ramoops";
++			reg = <0 0x8c100000 0 0x20000>;
++			no-map;
++			record-size = <0x4000>;
++			console-size = <0x4000>;
++		};
++	};
++};
++
++/*
++ * SBL de-initialises the UART pins, so they have to be configured again in
++ * all boot stages.
++ */
++&blsp_uart2_console_default {
++	bootph-all;
++};
+--- /dev/null
++++ b/configs/msm89xx-yiming-uz801-v3.config
+@@ -0,0 +1,2 @@
++# Yiming UZ801 v3 4G modem stick, 512 MiB RAM
++CONFIG_DEFAULT_DEVICE_TREE="qcom/msm8916-yiming-uz801v3"

@@ -36,8 +36,15 @@ define U-Boot/generic_ufi-esim
   UBOOT_CONFIG:=dragonboard410c msm89xx-openwrt msm89xx-ufi-esim
 endef
 
+define U-Boot/yiming_uz801-v3
+  NAME:=Yiming UZ801 v3
+  BUILD_DEVICES:=yiming_uz801-v3
+  UBOOT_CONFIG:=dragonboard410c msm89xx-openwrt msm89xx-yiming-uz801-v3
+endef
+
 UBOOT_TARGETS := \
-	generic_ufi-esim
+	generic_ufi-esim \
+	yiming_uz801-v3
 
 UBOOT_CUSTOMIZE_CONFIG := \
 	--disable TOOLS_KWBIMAGE \

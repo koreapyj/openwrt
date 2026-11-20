@@ -4,7 +4,8 @@
 board_config_update
 
 case "$(board_name)" in
-generic,ufi-esim)
+generic,ufi-esim|\
+yiming,uz801-v3)
 	ucidef_set_interface_lan "usb0"
 	ucidef_set_interface "wan" device "/dev/wwan0qmi0" protocol "uqmid"
 	# The USB gadget picks a random MAC address on every boot, so a DHCP

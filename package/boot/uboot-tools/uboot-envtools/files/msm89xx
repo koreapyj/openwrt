@@ -8,7 +8,8 @@ touch /etc/config/ubootenv
 board=$(board_name)
 
 case "$board" in
-generic,ufi-esim)
+generic,ufi-esim|\
+yiming,uz801-v3)
 	# only meaningful with mainline U-Boot (uboot-msm89xx) as aboot; the
 	# environment is two redundant 16 KiB copies at the start of the eMMC
 	# hardware boot partition boot1 (CONFIG_ENV_OFFSET{,_REDUND}). Writes

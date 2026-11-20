@@ -7,7 +7,8 @@
 # board.d must not do this: it runs from preinit on the read-only rom every
 # boot, leaving a stale uncommitted change in /tmp/.uci.
 case "$(board_name)" in
-generic,ufi-esim)
+generic,ufi-esim|\
+yiming,uz801-v3)
 	name="$(uci -q get usbgadget.@preset[0].name)"
 	udc="$(uci -q get usbgadget.@preset[0].UDC)"
 	if [ -z "$name" ] || { [ "$name" = "ncm" ] && [ -z "$udc" ]; }; then

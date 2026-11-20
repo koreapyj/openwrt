@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Yiming UZ801 v3.0 4G modem stick, OpenWrt additions to the mainline devicetree.
+ * Stock firmware: Android 4.4.4 "msm8916_32_512", baseband N958St_Z85_CN_JSXPH1IDN1H213.
+ * The stock image has no Bluetooth stack (no BluetoothExt/libbt-hci/bluetooth config).
+ */
+
+/dts-v1/;
+
+#include "msm8916-yiming-uz801v3.dts"
+#include "msm8916-openwrt-ramoops.dtsi"
+
+/ {
+	aliases {
+		led-boot = &led_r;
+		led-failsafe = &led_r;
+		led-running = &led_r;
+		led-upgrade = &led_r;
+	};
+};
+
+/* GPS: modem requests memory through the memshare QMI service (needs memshare patches) */
+&gps_mem {
+	status = "okay";
+};
+
+&memshare {
+	status = "okay";
+};
+
+/*
+ * Audio stage 1: only the APR bus to the modem QDSP6 with its q6core and q6afe
+ * services (answered by the modem firmware on "apr_audio_svc"). The q6asm/q6adm
+ * services have no driver yet and no sound card is defined; lpass is left alone.
+ */
+/*
+ * Audio stage 3: the modem voice services (MVM/CVS/CVP) for the q6voice
+ * drivers. Probing them sends nothing to the DSP; voice sessions are only
+ * created on request (by the rtproxy PCM driver below). The q6voice-dais
+ * child (ASoC CS-VOICE DAI) is left out; the rtproxy sound card is used.
+ */
+&apr {
+	status = "okay";
+
+	q6mvm: service@9 {
+		compatible = "qcom,q6mvm";
+		reg = <APR_SVC_ADSP_MVM>;
+	};
+
+	q6cvs: service@a {
+		compatible = "qcom,q6cvs";
+		reg = <APR_SVC_ADSP_CVS>;
+	};
+
+	q6cvp: service@b {
+		compatible = "qcom,q6cvp";
+		reg = <APR_SVC_ADSP_CVP>;
+	};
+};
+
+/*
+ * Audio stage 5: CS voice call audio as an ALSA sound card. The rtproxy
+ * child of q6afe is the PCM (capture = call downlink, playback = call
+ * uplink, through the AFE RT proxy ports 0x2000/0x2001); the card ties it to
+ * the dummy codec. No LPASS, MI2S or codec hardware is involved. The call
+ * path is started while a PCM stream is open, not at boot.
+ */
+&q6afe {
+	q6rtproxy: rtproxy {
+		compatible = "qcom,q6afe-rtproxy-pcm";
+		#sound-dai-cells = <0>;
+	};
+};
+
+/ {
+	sound {
+		compatible = "qcom,q6afe-rtproxy-card";
+		model = "MSM8916 Voice";
+		sound-dai = <&q6rtproxy>;
+	};
+};
+
+/*
+ * Proprietary firmware is read from the stock "modem" (vfat) and "persist"
+ * (ext4) partitions, mounted read-only at /lib/firmware/modem and
+ * /lib/firmware/persist by /lib/preinit/79_mount_firmware.
+ */
+&mpss {
+	firmware-name = "modem/image/mba.mbn", "modem/image/modem.mdt";
+};
+
+&wcnss {
+	firmware-name = "modem/image/wcnss.mdt";
+};
+
+/* read by both wcnss_ctrl (NV download) and wcn36xx (parent node) */
+&wcnss_ctrl {
+	firmware-name = "persist/WCNSS_qcom_wlan_nv.bin";
+};
+
+/*
+ * The PMIC RTC has no backup battery and is read-only for Linux (owned by
+ * TZ): it counts from power-on, so loading it sets the clock back to 1970.
+ */
+&pm8916_0 {
+	rtc@6000 {
+		status = "disabled";
+	};
+};
