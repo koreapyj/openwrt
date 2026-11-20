@@ -22,12 +22,15 @@ proto_qmi_init_config() {
 	proto_config_add_int profile
 	proto_config_add_int v6profile
 	proto_config_add_string devpath
+	proto_config_add_string netdev
+	proto_config_add_string dataport
 	proto_config_add_boolean dhcp
 	proto_config_add_boolean dhcpv6
 	proto_config_add_boolean sourcefilter
 	proto_config_add_boolean delegate
 	proto_config_add_boolean autoconnect
 	proto_config_add_int plmn
+	proto_config_add_boolean allow_roaming
 	proto_config_add_int timeout
 	proto_config_add_int mtu
 	proto_config_add_defaults
@@ -47,8 +50,8 @@ proto_qmi_setup() {
 	local apn auth delay device modes password pdptype pincode username v6apn
 	json_get_vars apn auth delay device modes password pdptype pincode username v6apn
 
-	local profile v6profile devpath dhcp dhcpv6 autoconnect plmn timeout
-	json_get_vars profile v6profile devpath dhcp dhcpv6 autoconnect plmn timeout
+	local profile v6profile devpath netdev dataport dhcp dhcpv6 autoconnect plmn timeout allow_roaming
+	json_get_vars profile v6profile devpath netdev dataport dhcp dhcpv6 autoconnect plmn timeout allow_roaming
 
 	[ "$timeout" = "" ] && timeout="10"
 
@@ -98,14 +101,45 @@ proto_qmi_setup() {
 	}
 
 	devname="$(basename "$device")"
-	devpath="$(readlink -f /sys/class/usbmisc/$devname/device/)"
-	ifname="$( ls "$devpath"/net )"
-	[ -n "$ifname" ] || {
+	if [ -n "$netdev" ]; then
+		ifname="$netdev"
+	elif [ -e "/sys/class/usbmisc/$devname" ]; then
+		devpath="$(readlink -f /sys/class/usbmisc/$devname/device/)"
+		ifname="$( ls "$devpath"/net )"
+	elif [ -e "/sys/class/wwan/$devname" ]; then
+		# WWAN subsystem port (e.g. SoC-integrated modems): the data
+		# netdevs are not children of the port, but live below the
+		# same parent device as the wwan device the port belongs to.
+		# Prefer the first data channel (dev_port 0).
+		local wwanparent net first
+		wwanparent="$(readlink -f "/sys/class/wwan/$devname/../device")"
+		for net in /sys/class/net/*; do
+			case "$(readlink -f "$net/device" 2>/dev/null)/" in
+			"$wwanparent"/*)
+				[ "$(cat "$net/dev_port" 2>/dev/null)" = "0" ] && {
+					ifname="${net##*/}"
+					break
+				}
+				: "${first:=${net##*/}}"
+				;;
+			esac
+		done
+		: "${ifname:=$first}"
+	fi
+	[ -n "$ifname" ] && [ -e "/sys/class/net/$ifname" ] || {
 		echo "The interface could not be found."
 		proto_notify_error "$interface" NO_IFACE
 		proto_set_available "$interface" 0
 		return 1
 	}
+
+	# BAM-DMUX (SoC-integrated modems): one netdev per channel, the
+	# channel index is exposed as dev_port. WDS clients must be bound
+	# to the matching SIO data port (A2 MUX RMNET<n>).
+	[ -z "$dataport" ] &&
+	[ "$(basename "$(readlink -f "/sys/class/net/$ifname/device/driver")")" = "bam-dmux" ] &&
+		dataport="a2-mux-rmnet$(cat "/sys/class/net/$ifname/dev_port")"
+	[ "$dataport" = "none" ] && dataport=
 
 	[ -n "$mtu" ] && {
 		echo "Setting MTU to $mtu"
@@ -141,9 +175,10 @@ proto_qmi_setup() {
 			echo "SIM in illegal state - Power-cycling SIM"
 
 			# Try to reset SIM application
-			uqmi -d "$device" -t 1000 --uim-power-off --uim-slot 1
+			# uqmi reads --uim-slot when the action is queued, so it must come first
+			uqmi -d "$device" -t 1000 --uim-slot 1 --uim-power-off
 			sleep 3
-			uqmi -d "$device" -t 1000 --uim-power-on --uim-slot 1
+			uqmi -d "$device" -t 1000 --uim-slot 1 --uim-power-on
 
 			if [ "$uim_state_timeout" -lt "$timeout" ] || [ "$timeout" = "0" ]; then
 				let uim_state_timeout++
@@ -251,19 +286,63 @@ proto_qmi_setup() {
 	uqmi -s -d "$device" -t 1000 --stop-network 0xffffffff --autoconnect > /dev/null 2>&1
 	uqmi -s -d "$device" -t 1000 --set-ip-family ipv6 --stop-network 0xffffffff --autoconnect > /dev/null 2>&1
 
+	pdptype="$(echo "$pdptype" | awk '{print tolower($0)}')"
+
+	[ "$pdptype" = "ip" -o "$pdptype" = "ipv6" -o "$pdptype" = "ipv4v6" ] || pdptype="ip"
+
+	# Configure PDP type and APN for profile 1 before registering: on LTE
+	# the modem attaches with it, so a stale APN (e.g. left by another SIM)
+	# gets the attach rejected and registration never completes.
+	# In case GGSN rejects IPv4v6 PDP, modem might not be able to
+	# establish a non-LTE data session.
+	profile_pdptype="$pdptype"
+	[ "$profile_pdptype" = "ip" ] && profile_pdptype="ipv4"
+	local profile_settings
+	profile_settings="$(uqmi -s -d "$device" -t 1000 --get-profile-settings "3gpp,1")"
+	if [ "$(echo "$profile_settings" | jsonfilter -e '@.apn')" != "$apn" ] ||
+	   [ "$(echo "$profile_settings" | jsonfilter -e '@["pdp-type"]')" != "$profile_pdptype" ]; then
+		echo "Setting APN '$apn' and PDP type $profile_pdptype for the attach profile"
+		uqmi -s -d "$device" -t 1000 --modify-profile "3gpp,1" --apn "$apn" --pdp-type "$profile_pdptype" > /dev/null 2>&1
+		# attach again with the new settings
+		uqmi -s -d "$device" -t 1000 --set-device-operating-mode low_power > /dev/null 2>&1
+		sleep 3
+	fi
+
 	# Go online
 	uqmi -s -d "$device" -t 1000 --set-device-operating-mode online > /dev/null 2>&1
 
 	# Set IP format
-	uqmi -s -d "$device" -t 1000 --set-data-format 802.3 > /dev/null 2>&1
-	uqmi -s -d "$device" -t 1000 --wda-set-data-format 802.3 > /dev/null 2>&1
-	json_load "$(uqmi -s -d "$device" -t 1000 --wda-get-data-format)"
-	json_get_var dataformat link-layer-protocol
+	if [ "$(cat /sys/class/net/$ifname/type 2>/dev/null)" = "519" ] &&
+	   [ ! -d "/sys/class/net/$ifname/qmi" ]; then
+		# ARPHRD_RAWIP netdev not driven by qmi_wwan (e.g. BAM-DMUX):
+		# the data path only carries raw IP packets and there is no
+		# driver attribute to switch. Modems without WDA service are
+		# switched through CTL.
+		local ctl_ok=0
+		uqmi -s -d "$device" -t 1000 --set-data-format raw-ip > /dev/null 2>&1 && ctl_ok=1
+		uqmi -s -d "$device" -t 1000 --wda-set-data-format raw-ip > /dev/null 2>&1
+		json_load "$(uqmi -s -d "$device" -t 1000 --wda-get-data-format)"
+		json_get_var dataformat link-layer-protocol
+		# The CTL setting is what counts for BAM-DMUX, ignore WDA then
+		[ "$ctl_ok" = 1 ] || [ "$dataformat" = "raw-ip" ] || [ "$dataformat" = "" ] || {
+			echo "Modem did not accept raw-ip data format (got $dataformat)"
+			proto_notify_error "$interface" DATA_FORMAT_FAILED
+			proto_block_restart "$interface"
+			return 1
+		}
+		dataformat=
+	else
+		uqmi -s -d "$device" -t 1000 --wda-set-data-format 802.3 > /dev/null 2>&1
+		json_load "$(uqmi -s -d "$device" -t 1000 --wda-get-data-format)"
+		json_get_var dataformat link-layer-protocol
+	fi
 
 	if [ "$dataformat" = "raw-ip" ]; then
 
 		[ -f /sys/class/net/$ifname/qmi/raw_ip ] || {
 			echo "Device only supports raw-ip mode but is missing this required driver attribute: /sys/class/net/$ifname/qmi/raw_ip"
+			proto_notify_error "$interface" RAW_IP_UNSUPPORTED
+			proto_block_restart "$interface"
 			return 1
 		}
 
@@ -304,9 +383,13 @@ proto_qmi_setup() {
 		[ "$serving_system" = "\"Invalid QMI command\"" ] && break
 		[ "$registration_state" = "registered" ] && break
 
-		if [ "$registration_state" = "searching" ] || [ "$registration_state" = "not_registered" ]; then
+		# A rejected attach (e.g. right after the attach profile changed or
+		# the modem re-registered) is often retried successfully by the
+		# modem, so keep waiting for it like for 'searching'.
+		if [ "$registration_state" = "searching" ] || [ "$registration_state" = "not_registered" ] ||
+		   [ "$registration_state" = "registering_denied" ]; then
 			if [ "$registration_timeout" -lt "$timeout" ] || [ "$timeout" = "0" ]; then
-				[ "$registration_state" = "searching" ] || {
+				[ "$registration_state" = "searching" ] || [ "$registration_state" = "registering_denied" ] || {
 					echo "Device stopped network registration. Restart network registration"
 					uqmi -s -d "$device" -t 20000 --network-register > /dev/null 2>&1
 				}
@@ -324,19 +407,15 @@ proto_qmi_setup() {
 		return 1
 	done
 
+	# allow_roaming defaults to allowed; only an explicit 0 denies it
+	if [ "$allow_roaming" = "0" ] &&
+	   [ "$(echo "$serving_system" | jsonfilter -e "@.roaming" 2>/dev/null)" = "true" ]; then
+		echo "Registered in roaming mode but roaming is not allowed"
+		proto_notify_error "$interface" ROAMING_NOT_ALLOWED
+		return 1
+	fi
 
 	echo "Starting network $interface"
-
-	pdptype="$(echo "$pdptype" | awk '{print tolower($0)}')"
-
-	[ "$pdptype" = "ip" -o "$pdptype" = "ipv6" -o "$pdptype" = "ipv4v6" ] || pdptype="ip"
-
-	# Configure PDP type and APN for profile 1.
-	# In case GGSN rejects IPv4v6 PDP, modem might not be able to
-	# establish a non-LTE data session.
-	profile_pdptype="$pdptype"
-	[ "$profile_pdptype" = "ip" ] && profile_pdptype="ipv4"
-	uqmi -s -d "$device" -t 1000 --modify-profile "3gpp,1" --apn "$apn" --pdp-type "$profile_pdptype" > /dev/null 2>&1
 
 	if [ "$pdptype" = "ip" ]; then
 		[ -z "$autoconnect" ] && autoconnect=1
@@ -353,6 +432,11 @@ proto_qmi_setup() {
 			return 1
 		fi
 
+		qmi_wds_bind "$cid_4" || {
+			proto_notify_error "$interface" BIND_FAILED
+			return 1
+		}
+
 		uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_4" --set-ip-family ipv4 > /dev/null 2>&1
 
 		pdh_4=$(uqmi -s -d "$device" -t 5000 --set-client-id wds,"$cid_4" \
@@ -368,17 +452,19 @@ proto_qmi_setup() {
 		if ! [ "$pdh_4" -eq "$pdh_4" ] 2> /dev/null; then
 			echo "Unable to connect IPv4"
 			uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_4" --release-client-id wds > /dev/null 2>&1
-			proto_notify_error "$interface" CALL_FAILED
-			return 1
+			pdh_4=""
+			cid_4=""
 		fi
 
 		# Check data connection state
-		connstat=$(uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_4" --get-data-status)
-		[ "$connstat" == '"connected"' ] || {
-			echo "No data link!"
-			uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_4" --release-client-id wds > /dev/null 2>&1
-			proto_notify_error "$interface" CALL_FAILED
-			return 1
+		[ -n "$pdh_4" ] && {
+			connstat=$(uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_4" --get-data-status)
+			[ "$connstat" == '"connected"' ] || {
+				echo "No data link!"
+				uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_4" --release-client-id wds > /dev/null 2>&1
+				pdh_4=""
+				cid_4=""
+			}
 		}
 	}
 
@@ -389,6 +475,11 @@ proto_qmi_setup() {
 			proto_notify_error "$interface" NO_CID
 			return 1
 		fi
+
+		qmi_wds_bind "$cid_6" || {
+			proto_notify_error "$interface" BIND_FAILED
+			return 1
+		}
 
 		uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_6" --set-ip-family ipv6 > /dev/null 2>&1
 
@@ -408,18 +499,26 @@ proto_qmi_setup() {
 		if ! [ "$pdh_6" -eq "$pdh_6" ] 2> /dev/null; then
 			echo "Unable to connect IPv6"
 			uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_6" --release-client-id wds > /dev/null 2>&1
-			proto_notify_error "$interface" CALL_FAILED
-			return 1
+			pdh_6=""
+			cid_6=""
 		fi
 
 		# Check data connection state
-		connstat=$(uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_6" --set-ip-family ipv6 --get-data-status)
-		[ "$connstat" == '"connected"' ] || {
-			echo "No data link!"
-			uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_6" --release-client-id wds > /dev/null 2>&1
-			proto_notify_error "$interface" CALL_FAILED
-			return 1
+		[ -n "$pdh_6" ] && {
+			connstat=$(uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_6" --set-ip-family ipv6 --get-data-status)
+			[ "$connstat" == '"connected"' ] || {
+				echo "No data link!"
+				uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid_6" --release-client-id wds > /dev/null 2>&1
+				pdh_6=""
+				cid_6=""
+			}
 		}
+	}
+
+	# fail only if no requested family came up (e.g. IPv6 may be rejected by the network)
+	[ -n "$pdh_4" -o -n "$pdh_6" ] || {
+		proto_notify_error "$interface" CALL_FAILED
+		return 1
 	}
 
 	echo "Setting up $ifname"
@@ -516,6 +615,20 @@ proto_qmi_setup() {
 			ubus call network add_dynamic "$(json_dump)"
 		fi
 	}
+}
+
+qmi_wds_bind() {
+	local cid="$1"
+
+	[ -n "$dataport" ] || return 0
+
+	uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid" \
+		--bind-data-port "$dataport" > /dev/null 2>&1 && return 0
+
+	echo "Unable to bind data port $dataport"
+	uqmi -s -d "$device" -t 1000 --set-client-id wds,"$cid" \
+		--release-client-id wds > /dev/null 2>&1
+	return 1
 }
 
 qmi_wds_stop() {

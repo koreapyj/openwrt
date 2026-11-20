@@ -1,0 +1,3344 @@
+From: Yoonji Park <koreapyj@dcmys.kr>
+Subject: [PATCH] uqmi: add SoC-integrated modem, PDC, VOICE and roaming commands
+
+- fix --set-data-format, which parsed its argument but never sent the
+  request. It is required on modems without the WDA service, e.g.
+  Qualcomm SoC-integrated modems using BAM-DMUX.
+- add --bind-data-port to bind a WDS client to the SIO port of a data
+  channel ("a2-mux-rmnet<0-7>" or a raw port number)
+- add support for waiting on indications, used by requests whose result
+  is delivered later as an indication, and UQMI_DEBUG=1 to dump all
+  messages
+- add the PDC commands (--pdc-list-configs, --pdc-get-selected-config,
+  --pdc-load-config, --pdc-activate-config, --pdc-deactivate-config,
+  --pdc-delete-config, --pdc-config-type)
+- add the VOICE commands (--voice-dial, --voice-end-call,
+  --voice-answer-call, --voice-get-all-call-info, --voice-burst-dtmf,
+  --voice-start-dtmf, --voice-stop-dtmf, --voice-indications)
+- add --get-network-roaming and --network-change-duration to the NAS
+  commands
+- use the shared SMS codec, frame, PDC, voice and WDS helpers of the
+  common library
+---
+--- a/uqmi/CMakeLists.txt
++++ b/uqmi/CMakeLists.txt
+@@ -1,6 +1,6 @@
+ 
+ 
+-SET(UQMI uqmi.c dev.c commands.c ${SOURCES})
++SET(UQMI uqmi.c dev.c commands.c sms-json.c ${SOURCES})
+ 
+ ADD_EXECUTABLE(uqmi ${UQMI})
+ ADD_DEPENDENCIES(uqmi gen-headers gen-errors)
+--- a/uqmi/commands-dms.c
++++ b/uqmi/commands-dms.c
+@@ -94,22 +94,7 @@ cmd_dms_get_capabilities_prepare(struct qmi_dev *qmi, struct qmi_request *req, s
+ 
+ const char *get_pin_status(int status)
+ {
+-	static const char *pin_status[] = {
+-		[QMI_DMS_UIM_PIN_STATUS_NOT_INITIALIZED] = "not_initialized",
+-		[QMI_DMS_UIM_PIN_STATUS_ENABLED_NOT_VERIFIED] = "not_verified",
+-		[QMI_DMS_UIM_PIN_STATUS_ENABLED_VERIFIED] = "verified",
+-		[QMI_DMS_UIM_PIN_STATUS_DISABLED] = "disabled",
+-		[QMI_DMS_UIM_PIN_STATUS_BLOCKED] = "blocked",
+-		[QMI_DMS_UIM_PIN_STATUS_PERMANENTLY_BLOCKED] = "permanently_blocked",
+-		[QMI_DMS_UIM_PIN_STATUS_UNBLOCKED] = "unblocked",
+-		[QMI_DMS_UIM_PIN_STATUS_CHANGED] = "changed",
+-	};
+-	const char *res = "Unknown";
+-
+-	if (status < ARRAY_SIZE(pin_status) && pin_status[status])
+-		res = pin_status[status];
+-
+-	return res;
++	return ext_pin_status_name(status);
+ }
+ 
+ static void cmd_dms_get_pin_status_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
+--- a/uqmi/commands-nas.c
++++ b/uqmi/commands-nas.c
+@@ -22,6 +22,7 @@
+ #include "uqmi.h"
+ #include "qmi-message.h"
+ #include "commands.h"
++#include "ext-fmt.h"
+ 
+ #include <libubox/blobmsg.h>
+ 
+@@ -39,66 +40,7 @@ static struct	{
+ static void
+ print_earfcn_info(uint32_t earfcn)
+ {
+-	/* https://www.sqimway.com/lte_band.php */
+-	static const struct {
+-		uint32_t    min;
+-		uint32_t    max;
+-		uint16_t    band;
+-		uint16_t    freq;
+-		const char *duplex;
+-	} earfcn_ranges[] = {
+-		{     0,   599, 1,  2100, "FDD" },
+-		{   600,  1199, 2,  1800, "FDD" },
+-		{  1200,  1949, 3,  1800, "FDD" },
+-		{  1950,  2399, 4,  1700, "FDD" },
+-		{  2400,  2649, 5,  850,  "FDD" },
+-		{  2650,  2749, 6,  800,  "FDD" },
+-		{  2750,  3449, 7,  2600, "FDD" },
+-		{  3450,  3799, 8,  900,  "FDD" },
+-		{  3800,  4149, 9,  1800, "FDD" },
+-		{  4150,  4749, 10, 1700, "FDD" },
+-		{  4750,  4999, 11, 1500, "FDD" },
+-		{  5000,  5179, 12, 700,  "FDD" },
+-		{  5180,  5279, 13, 700,  "FDD" },
+-		{  5280,  5379, 14, 700,  "FDD" },
+-		{  5730,  5849, 17, 700,  "FDD" },
+-		{  5850,  5999, 18, 850,  "FDD" },
+-		{  6000,  6149, 19, 850,  "FDD" },
+-		{  6150,  6449, 20, 800,  "FDD" },
+-		{  6450,  6599, 21, 1500, "FDD" },
+-		{  6600,  7399, 22, 3500, "FDD" },
+-		{  7500,  7699, 23, 2000, "FDD" },
+-		{  7700,  8039, 24, 1600, "FDD" },
+-		{  8040,  8689, 25, 1900, "FDD" },
+-		{  8690,  9039, 26, 850,  "FDD" },
+-		{  9040,  9209, 27, 800,  "FDD" },
+-		{  9210,  9659, 28, 700,  "FDD" },
+-		{  9660,  9769, 29, 700,  "SDL" },
+-		{  9770,  9869, 30, 2300, "FDD" },
+-		{  9870,  9919, 31, 450,  "FDD" },
+-		{  9920, 10359, 32, 1500, "SDL" },
+-		{ 36000, 36199, 33, 1900, "TDD" },
+-		{ 36200, 36349, 34, 2000, "TDD" },
+-		{ 36350, 36949, 35, 1900, "TDD" },
+-		{ 36950, 37549, 36, 1900, "TDD" },
+-		{ 37550, 37749, 37, 1900, "TDD" },
+-		{ 37750, 38249, 38, 2600, "TDD" },
+-		{ 38250, 38649, 39, 1900, "TDD" },
+-		{ 38650, 39649, 40, 2300, "TDD" },
+-		{ 39650, 41589, 41, 2500, "TDD" },
+-		{ 41590, 43589, 42, 3500, "TDD" },
+-		{ 43590, 45589, 43, 3700, "TDD" },
+-		{ 45590, 46589, 44, 700,  "TDD" },
+-	};
+-
+-	for (int i = 0; i < (sizeof(earfcn_ranges) / sizeof(*earfcn_ranges)); i++) {
+-		if (earfcn <= earfcn_ranges[i].max && earfcn >= earfcn_ranges[i].min) {
+-			blobmsg_add_u32(&status, "band", earfcn_ranges[i].band);
+-			blobmsg_add_u32(&status, "frequency", earfcn_ranges[i].freq);
+-			blobmsg_add_string(&status, "duplex", earfcn_ranges[i].duplex);
+-			return;
+-		}
+-	}
++	ext_fmt_earfcn(&status, earfcn);
+ }
+ 
+ static char *
+@@ -211,21 +153,28 @@ cmd_nas_set_network_preference_prepare(struct qmi_dev *qmi, struct qmi_request *
+ static enum qmi_cmd_result
+ cmd_nas_set_roaming_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+ {
+-	QmiNasRoamingPreference pref;
+-
+-	if (!strcmp(arg, "any"))
+-		pref = QMI_NAS_ROAMING_PREFERENCE_ANY;
+-	else if (!strcmp(arg, "only"))
+-		pref = QMI_NAS_ROAMING_PREFERENCE_NOT_OFF;
+-	else if (!strcmp(arg, "off"))
+-		pref = QMI_NAS_ROAMING_PREFERENCE_OFF;
+-	else
++	uint8_t pref;
++
++	if (!ext_nas_roaming_parse(arg, &pref))
+ 		return uqmi_add_error("Invalid argument");
+ 
+ 	qmi_set(&sel_req, roaming_preference, pref);
+ 	return do_sel_network();
+ }
+ 
++#define cmd_nas_set_change_duration_cb no_cb
++static enum qmi_cmd_result
++cmd_nas_set_change_duration_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	uint8_t duration;
++
++	if (!ext_nas_change_duration_parse(arg, &duration))
++		return uqmi_add_error("Invalid argument");
++
++	qmi_set(&sel_req, change_duration, duration);
++	return QMI_CMD_DONE;
++}
++
+ #define cmd_nas_set_mcc_cb no_cb
+ static enum qmi_cmd_result
+ cmd_nas_set_mcc_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+@@ -614,77 +563,15 @@ cmd_nas_get_system_info_prepare(struct qmi_dev *qmi, struct qmi_request *req, st
+ 	return QMI_CMD_REQUEST;
+ }
+ 
+-static void
+-print_channel_info(int32_t cell_id, int32_t channel, uint32_t bw)
+-{
+-	static const char *map_bandwidth[] = {
+-		[QMI_NAS_DL_BANDWIDTH_1_4] = "1.4",
+-		[QMI_NAS_DL_BANDWIDTH_3] = "3",
+-		[QMI_NAS_DL_BANDWIDTH_5] = "5",
+-		[QMI_NAS_DL_BANDWIDTH_10] = "10",
+-		[QMI_NAS_DL_BANDWIDTH_15] = "15",
+-		[QMI_NAS_DL_BANDWIDTH_20] = "20",
+-		[QMI_NAS_DL_BANDWIDTH_INVALID] = "invalid",
+-		[QMI_NAS_DL_BANDWIDTH_UNKNOWN] = "unknown",
+-	};
+-
+-	blobmsg_add_u32(&status, "cell_id", cell_id);
+-	blobmsg_add_u32(&status, "channel", channel);
+-	print_earfcn_info(channel);
+-	blobmsg_add_string(&status, "bandwidth", map_bandwidth[bw]);
+-}
+-
+ static void
+ cmd_nas_get_lte_cphy_ca_info_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
+ {
+ 	struct qmi_nas_get_lte_cphy_ca_info_response res;
+-	static const char *scell_state[] = {
+-		[QMI_NAS_SCELL_STATE_DECONFIGURED] = "deconfigured",
+-		[QMI_NAS_SCELL_STATE_DEACTIVATED] = "deactivated",
+-		[QMI_NAS_SCELL_STATE_ACTIVATED] = "activated",
+-	};
+-	char idx_buf[16];
+-	void *t, *c;
+-	int i;
++	void *t;
+ 
+ 	qmi_parse_nas_get_lte_cphy_ca_info_response(msg, &res);
+ 	t = blobmsg_open_table(&status, NULL);
+-	if (res.set.phy_ca_agg_pcell_info) {
+-		c = blobmsg_open_table(&status, "primary");
+-		print_channel_info(res.data.phy_ca_agg_pcell_info.physical_cell_id,
+-				   res.data.phy_ca_agg_pcell_info.rx_channel,
+-				   res.data.phy_ca_agg_pcell_info.dl_bandwidth);
+-		blobmsg_close_table(&status, c);
+-	}
+-	if (res.set.phy_ca_agg_scell_info && res.data.phy_ca_agg_secondary_cells_n) {
+-		for (i = 0; i < res.data.phy_ca_agg_secondary_cells_n; i++) {
+-			if (res.data.phy_ca_agg_secondary_cells[i].rx_channel == 0)
+-				break;
+-			sprintf(idx_buf, "secondary_%d",
+-				res.data.phy_ca_agg_secondary_cells[i].cell_index);
+-			c = blobmsg_open_table(&status, idx_buf);
+-			print_channel_info(res.data.phy_ca_agg_secondary_cells[i].physical_cell_id,
+-					   res.data.phy_ca_agg_secondary_cells[i].rx_channel,
+-					   res.data.phy_ca_agg_secondary_cells[i].dl_bandwidth);
+-			blobmsg_add_string(&status, "state",
+-					   scell_state[res.data.phy_ca_agg_secondary_cells[i].state]);
+-			blobmsg_close_table(&status, c);
+-		}
+-	} else {
+-		if (res.set.scell_index)
+-			sprintf(idx_buf, "secondary_%d", res.data.scell_index);
+-		else
+-			sprintf(idx_buf, "secondary");
+-		if (res.set.phy_ca_agg_scell_info && res.data.phy_ca_agg_scell_info.rx_channel != 0) {
+-			c = blobmsg_open_table(&status, idx_buf);
+-			print_channel_info(res.data.phy_ca_agg_scell_info.physical_cell_id,
+-					   res.data.phy_ca_agg_scell_info.rx_channel,
+-					   res.data.phy_ca_agg_scell_info.dl_bandwidth);
+-			blobmsg_add_string(&status, "state",
+-					   scell_state[res.data.phy_ca_agg_scell_info.state]);
+-			blobmsg_close_table(&status, c);
+-		}
+-	}
++	ext_fmt_lte_cphy_ca_info(&status, &res);
+ 	blobmsg_close_table(&status, t);
+ }
+ 
+@@ -695,86 +582,15 @@ cmd_nas_get_lte_cphy_ca_info_prepare(struct qmi_dev *qmi, struct qmi_request *re
+ 	return QMI_CMD_REQUEST;
+ }
+ 
+-static void
+-print_chain_info(int8_t radio, bool tuned, int32_t rssi, int32_t ecio, int32_t rsrp, int32_t rscp, uint32_t phase)
+-{
+-	blobmsg_add_u8(&status, "tuned", tuned);
+-	blobmsg_add_double(&status, "rssi", (double) rssi*0.1);
+-	if (radio == QMI_NAS_RADIO_INTERFACE_5GNR) {
+-		blobmsg_add_double(&status, "rsrp", (double) rsrp*-0.1);
+-	}
+-	else if (radio == QMI_NAS_RADIO_INTERFACE_LTE) {
+-		blobmsg_add_double(&status, "rsrq", (double) ecio*-0.1);
+-		blobmsg_add_double(&status, "rsrp", (double) rsrp*-0.1);
+-	}
+-	else if (radio == QMI_NAS_RADIO_INTERFACE_UMTS) {
+-		blobmsg_add_double(&status, "ecio", (double) ecio*-0.1);
+-		blobmsg_add_double(&status, "rscp", (double) rscp*-0.1);
+-	}
+-	if (phase != 0xFFFFFFFF)
+-		blobmsg_add_double(&status, "phase", (double) phase*0.01);
+-}
+-
+ static void
+ cmd_nas_get_tx_rx_info_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
+ {
+ 	struct qmi_nas_get_tx_rx_info_response res;
+-	void *c, *t;
++	void *t;
+ 
+ 	qmi_parse_nas_get_tx_rx_info_response(msg, &res);
+ 	t = blobmsg_open_table(&status, NULL);
+-	if (res.set.rx_chain_0_info) {
+-		c = blobmsg_open_table(&status, "rx_chain_0");
+-		print_chain_info(tx_rx_req.data.radio_interface,
+-				 res.data.rx_chain_0_info.is_radio_tuned,
+-				 res.data.rx_chain_0_info.rx_power,
+-				 res.data.rx_chain_0_info.ecio,
+-				 res.data.rx_chain_0_info.rsrp,
+-				 res.data.rx_chain_0_info.rscp,
+-				 res.data.rx_chain_0_info.phase);
+-		blobmsg_close_table(&status, c);
+-	}
+-	if (res.set.rx_chain_1_info) {
+-		c = blobmsg_open_table(&status, "rx_chain_1");
+-		print_chain_info(tx_rx_req.data.radio_interface,
+-				 res.data.rx_chain_1_info.is_radio_tuned,
+-				 res.data.rx_chain_1_info.rx_power,
+-				 res.data.rx_chain_1_info.ecio,
+-				 res.data.rx_chain_1_info.rsrp,
+-				 res.data.rx_chain_1_info.rscp,
+-				 res.data.rx_chain_1_info.phase);
+-		blobmsg_close_table(&status, c);
+-	}
+-	if (res.set.rx_chain_2_info) {
+-		c = blobmsg_open_table(&status, "rx_chain_2");
+-		print_chain_info(tx_rx_req.data.radio_interface,
+-				 res.data.rx_chain_2_info.is_radio_tuned,
+-				 res.data.rx_chain_2_info.rx_power,
+-				 res.data.rx_chain_2_info.ecio,
+-				 res.data.rx_chain_2_info.rsrp,
+-				 res.data.rx_chain_2_info.rscp,
+-				 res.data.rx_chain_2_info.phase);
+-		blobmsg_close_table(&status, c);
+-	}
+-	if (res.set.rx_chain_3_info) {
+-		c = blobmsg_open_table(&status, "rx_chain_3");
+-		print_chain_info(tx_rx_req.data.radio_interface,
+-				 res.data.rx_chain_3_info.is_radio_tuned,
+-				 res.data.rx_chain_3_info.rx_power,
+-				 res.data.rx_chain_3_info.ecio,
+-				 res.data.rx_chain_3_info.rsrp,
+-				 res.data.rx_chain_3_info.rscp,
+-				 res.data.rx_chain_3_info.phase);
+-		blobmsg_close_table(&status, c);
+-	}
+-	if (res.set.tx_info) {
+-		c = blobmsg_open_table(&status, "tx");
+-		blobmsg_add_u8(&status, "traffic", res.data.tx_info.is_in_traffic);
+-		if (res.data.tx_info.is_in_traffic)
+-			blobmsg_add_double(&status, "tx_power",
+-					   (double) res.data.tx_info.tx_power*0.1);
+-		blobmsg_close_table(&status, c);
+-	}
++	ext_fmt_tx_rx_info(&status, tx_rx_req.data.radio_interface, &res);
+ 	blobmsg_close_table(&status, t);
+ }
+ 
+@@ -782,17 +598,9 @@ cmd_nas_get_tx_rx_info_cb(struct qmi_dev *qmi, struct qmi_request *req, struct q
+ static enum qmi_cmd_result
+ cmd_nas_get_tx_rx_info_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+ {
+-	int radio = 0;
+-
+-	if (!strcmp(arg, "5gnr"))
+-		radio = QMI_NAS_RADIO_INTERFACE_5GNR;
+-	else if (!strcmp(arg, "lte"))
+-		radio = QMI_NAS_RADIO_INTERFACE_LTE;
+-	else if (!strcmp(arg, "umts"))
+-		radio = QMI_NAS_RADIO_INTERFACE_UMTS;
+-	else if (!strcmp(arg, "gsm"))
+-		radio = QMI_NAS_RADIO_INTERFACE_GSM;
+-	else
++	int8_t radio;
++
++	if (!ext_nas_radio_parse(arg, &radio))
+ 		return uqmi_add_error("Invalid argument");
+ 
+ 	qmi_set(&tx_rx_req, radio_interface, radio);
+@@ -1126,6 +934,25 @@ cmd_nas_get_plmn_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qm
+ 	return QMI_CMD_REQUEST;
+ }
+ 
++static void
++cmd_nas_get_roaming_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
++{
++	struct qmi_nas_get_system_selection_preference_response res;
++	const char *str;
++
++	qmi_parse_nas_get_system_selection_preference_response(msg, &res);
++	str = ext_nas_roaming_name(res.set.roaming_preference, res.data.roaming_preference);
++
++	blobmsg_add_string(&status, NULL, str);
++}
++
++static enum qmi_cmd_result
++cmd_nas_get_roaming_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	qmi_set_nas_get_system_selection_preference_request(msg);
++	return QMI_CMD_REQUEST;
++}
++
+ static void
+ cmd_nas_network_scan_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
+ {
+--- a/uqmi/commands-nas.h
++++ b/uqmi/commands-nas.h
+@@ -32,6 +32,8 @@
+ 	__uqmi_command(nas_get_serving_system, get-serving-system, no, QMI_SERVICE_NAS), \
+ 	__uqmi_command(nas_set_network_preference, set-network-preference, required, CMD_TYPE_OPTION), \
+ 	__uqmi_command(nas_set_roaming, set-network-roaming, required, CMD_TYPE_OPTION), \
++	__uqmi_command(nas_get_roaming, get-network-roaming, no, QMI_SERVICE_NAS), \
++	__uqmi_command(nas_set_change_duration, network-change-duration, required, CMD_TYPE_OPTION), \
+ 	__uqmi_command(nas_get_system_info, get-system-info, no, QMI_SERVICE_NAS), \
+ 	__uqmi_command(nas_get_lte_cphy_ca_info, get-lte-cphy-ca-info, no, QMI_SERVICE_NAS), \
+ 	__uqmi_command(nas_get_cell_location_info, get-cell-location-info, no, QMI_SERVICE_NAS), \
+@@ -43,7 +45,11 @@
+ 		"  --set-network-preference <mode>:  Set preferred network mode to <mode>\n" \
+ 		"                                    Available modes: auto, gsm, wcdma\n" \
+ 		"  --set-network-roaming <mode>:     Set roaming preference:\n" \
+-		"                                    Available modes: any, off, only\n" \
++		"                                    Available modes: any, off (home networks only),\n" \
++		"                                    only (roaming networks only)\n" \
++		"    --network-change-duration <d>:  Apply the selection change permanently or until power cycle\n" \
++		"                                    Available values: permanent, power-cycle (default: not sent)\n" \
++		"  --get-network-roaming:            Get roaming preference (any, off, only, not-flashing, unknown)\n" \
+ 		"  --network-scan:                   Initiate network scan\n" \
+ 		"  --network-register:               Initiate network register\n" \
+ 		"  --set-plmn:                       Register at specified network\n" \
+--- /dev/null
++++ b/uqmi/commands-pdc.c
+@@ -0,0 +1,653 @@
++/*
++ * uqmi -- tiny QMI support implementation
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++ * Boston, MA 02110-1301 USA.
++ */
++
++#include "qmi-message.h"
++#include "pdc-util.h"
++
++/*
++ * Most PDC results are not part of the response to a request, but are sent
++ * as an indication (carrying the request's token) afterwards. The commands
++ * below register an indication listener (see qmi_indication_listen()) and
++ * drive multi-step operations from the indication callback.
++ */
++
++#define PDC_IND_TIMEOUT		10000	/* ms to wait for each indication */
++#define PDC_LOAD_SIZE_MAX	(16 * 1024 * 1024)
++
++enum {
++	PDC_IND_GET_SELECTED_CONFIG = 0x22,
++	PDC_IND_SET_SELECTED_CONFIG = 0x23,
++	PDC_IND_LIST_CONFIGS = 0x24,
++	PDC_IND_LOAD_CONFIG = 0x26,
++	PDC_IND_ACTIVATE_CONFIG = 0x27,
++	PDC_IND_GET_CONFIG_INFO = 0x28,
++	PDC_IND_DEACTIVATE_CONFIG = 0x2b,
++};
++
++static uint32_t pdc_config_type = QMI_PDC_CONFIGURATION_TYPE_SOFTWARE;
++static uint32_t pdc_token;
++static struct qmi_request pdc_req;
++
++static uint16_t pdc_ind_id(struct qmi_msg *msg)
++{
++	return le16_to_cpu(msg->svc.message);
++}
++
++static void pdc_fail(struct qmi_dev *qmi, const char *msg)
++{
++	uqmi_add_error(msg);
++	qmi_indication_done(qmi, -1);
++}
++
++/* Handles the response to a follow-up request sent from an indication callback */
++static void pdc_req_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
++{
++	if (msg)
++		return;
++
++	if (req->ret == QMI_ERROR_CANCELLED && qmi->ind.cb) {
++		/* modem went away, let the listener decide whether this is expected */
++		qmi->ind.cb(qmi, NULL);
++		qmi_indication_done(qmi, -1);
++		return;
++	}
++
++	pdc_fail(qmi, qmi_get_error_str(req->ret));
++}
++
++static void pdc_send_request(struct qmi_dev *qmi)
++{
++	if (qmi_request_pending(&pdc_req))
++		qmi_request_cancel(qmi, &pdc_req);
++
++	qmi_request_start(qmi, &pdc_req, pdc_req_cb);
++}
++
++static void pdc_add_id(const char *name, const uint8_t *id, unsigned int len)
++{
++	char str[PDC_ID_STR_MAX];
++
++	if (pdc_id_format(id, len, str))
++		blobmsg_add_string(&status, name, str);
++}
++
++#define cmd_pdc_config_type_cb no_cb
++static enum qmi_cmd_result
++cmd_pdc_config_type_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	uint32_t type;
++
++	if (!pdc_type_parse(arg, &type)) {
++		uqmi_add_error("Invalid value (valid: software, platform)");
++		return QMI_CMD_EXIT;
++	}
++
++	pdc_config_type = type;
++	return QMI_CMD_DONE;
++}
++
++/* --pdc-get-selected-config */
++
++static void pdc_get_selected_config_ind(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	struct qmi_pdc_get_selected_config_indication res;
++	void *c;
++
++	if (!msg) {
++		pdc_fail(qmi, "Timed out waiting for indication");
++		return;
++	}
++
++	if (pdc_ind_id(msg) != PDC_IND_GET_SELECTED_CONFIG)
++		return;
++
++	qmi_parse_pdc_get_selected_config_indication(msg, &res);
++	if (!pdc_token_valid(res.set.token, res.data.token, pdc_token))
++		return;
++
++	/* not provisioned: no configuration selected yet */
++	if (pdc_result_failed(res.set.indication_result, res.data.indication_result, true)) {
++		pdc_fail(qmi, qmi_get_error_str(res.data.indication_result));
++		return;
++	}
++
++	c = blobmsg_open_table(&status, NULL);
++	blobmsg_add_string(&status, "type", pdc_type_name(pdc_config_type));
++	if (res.data.active_id_n)
++		pdc_add_id("active", res.data.active_id, res.data.active_id_n);
++	if (res.data.pending_id_n)
++		pdc_add_id("pending", res.data.pending_id, res.data.pending_id_n);
++	blobmsg_close_table(&status, c);
++
++	qmi_indication_done(qmi, 0);
++}
++
++#define cmd_pdc_get_selected_config_cb no_cb
++static enum qmi_cmd_result
++cmd_pdc_get_selected_config_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_pdc_get_selected_config_request data = {
++		QMI_INIT(config_type, pdc_config_type),
++		QMI_INIT(token, ++pdc_token),
++	};
++
++	qmi_set_pdc_get_selected_config_request(msg, &data);
++	qmi_indication_listen(qmi, QMI_SERVICE_PDC, pdc_get_selected_config_ind, PDC_IND_TIMEOUT);
++	return QMI_CMD_REQUEST;
++}
++
++/* --pdc-list-configs */
++
++static struct {
++	enum {
++		PDC_LIST_STEP_SELECTED,
++		PDC_LIST_STEP_LIST,
++		PDC_LIST_STEP_INFO,
++	} step;
++
++	uint8_t active[PDC_ID_MAX];
++	unsigned int active_n;
++	uint8_t pending[PDC_ID_MAX];
++	unsigned int pending_n;
++
++	struct pdc_list_config {
++		uint32_t type;
++		uint8_t id[PDC_ID_MAX];
++		unsigned int id_n;
++		char *description;
++		uint32_t version;
++		uint32_t size;
++	} *configs;
++	unsigned int n_configs;
++	unsigned int cur;
++} pdc_list;
++
++static void pdc_list_free(void)
++{
++	unsigned int i;
++
++	for (i = 0; i < pdc_list.n_configs; i++)
++		free(pdc_list.configs[i].description);
++
++	free(pdc_list.configs);
++	memset(&pdc_list, 0, sizeof(pdc_list));
++}
++
++static void pdc_list_print(void)
++{
++	void *a, *c;
++	unsigned int i;
++
++	a = blobmsg_open_array(&status, NULL);
++	for (i = 0; i < pdc_list.n_configs; i++) {
++		struct pdc_list_config *cfg = &pdc_list.configs[i];
++
++		c = blobmsg_open_table(&status, NULL);
++		blobmsg_add_string(&status, "type", pdc_type_name(cfg->type));
++		pdc_add_id("id", cfg->id, cfg->id_n);
++		blobmsg_add_string(&status, "description", cfg->description ? cfg->description : "");
++		blobmsg_printf(&status, "version", "0x%x", cfg->version);
++		blobmsg_add_u32(&status, "size", cfg->size);
++		blobmsg_add_u8(&status, "active",
++			       pdc_id_equal(cfg->id, cfg->id_n, pdc_list.active, pdc_list.active_n));
++		blobmsg_add_u8(&status, "pending",
++			       pdc_id_equal(cfg->id, cfg->id_n, pdc_list.pending, pdc_list.pending_n));
++		blobmsg_close_table(&status, c);
++	}
++	blobmsg_close_array(&status, a);
++}
++
++static void pdc_list_request_info(struct qmi_dev *qmi)
++{
++	struct pdc_list_config *cfg = &pdc_list.configs[pdc_list.cur];
++	struct qmi_pdc_get_config_info_request data = {
++		QMI_INIT_SEQUENCE(type_with_id_v2,
++			.config_type = cfg->type,
++			.id_n = cfg->id_n,
++			.id = cfg->id
++		),
++		QMI_INIT(token, ++pdc_token),
++	};
++
++	qmi_set_pdc_get_config_info_request(qmi->buf, &data);
++	pdc_send_request(qmi);
++}
++
++static void pdc_list_ind(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	uint16_t id;
++
++	if (!msg) {
++		/* no configuration stored: the modem does not send any indication */
++		if (pdc_list.step == PDC_LIST_STEP_LIST) {
++			pdc_list_print();
++			qmi_indication_done(qmi, 0);
++		} else {
++			pdc_fail(qmi, "Timed out waiting for indication");
++		}
++		return;
++	}
++
++	id = pdc_ind_id(msg);
++	if (id == PDC_IND_GET_SELECTED_CONFIG && pdc_list.step == PDC_LIST_STEP_SELECTED) {
++		struct qmi_pdc_get_selected_config_indication res;
++		struct qmi_pdc_list_configs_request data = {
++			QMI_INIT(config_type, pdc_config_type),
++			QMI_INIT(token, 0),
++		};
++
++		qmi_parse_pdc_get_selected_config_indication(msg, &res);
++		if (!pdc_token_valid(res.set.token, res.data.token, pdc_token))
++			return;
++
++		if (pdc_result_failed(res.set.indication_result, res.data.indication_result, true)) {
++			pdc_fail(qmi, qmi_get_error_str(res.data.indication_result));
++			return;
++		}
++
++		if (res.data.active_id_n <= PDC_ID_MAX) {
++			pdc_list.active_n = res.data.active_id_n;
++			memcpy(pdc_list.active, res.data.active_id, pdc_list.active_n);
++		}
++		if (res.data.pending_id_n <= PDC_ID_MAX) {
++			pdc_list.pending_n = res.data.pending_id_n;
++			memcpy(pdc_list.pending, res.data.pending_id, pdc_list.pending_n);
++		}
++
++		pdc_list.step = PDC_LIST_STEP_LIST;
++		data.data.token = ++pdc_token;
++		qmi_set_pdc_list_configs_request(qmi->buf, &data);
++		pdc_send_request(qmi);
++	} else if (id == PDC_IND_LIST_CONFIGS && pdc_list.step == PDC_LIST_STEP_LIST) {
++		struct qmi_pdc_list_configs_indication res;
++		unsigned int i;
++
++		qmi_parse_pdc_list_configs_indication(msg, &res);
++		if (!pdc_token_valid(res.set.token, res.data.token, pdc_token))
++			return;
++
++		if (res.set.indication_result && res.data.indication_result) {
++			pdc_fail(qmi, qmi_get_error_str(res.data.indication_result));
++			return;
++		}
++
++		pdc_list.configs = calloc(res.data.configs_n, sizeof(*pdc_list.configs));
++		if (res.data.configs_n && !pdc_list.configs) {
++			pdc_fail(qmi, "Out of memory");
++			return;
++		}
++
++		for (i = 0; i < res.data.configs_n; i++) {
++			if (res.data.configs[i].id_n > PDC_ID_MAX) {
++				pdc_fail(qmi, "Configuration ID too long");
++				return;
++			}
++
++			pdc_list.configs[i].type = res.data.configs[i].config_type;
++			pdc_list.configs[i].id_n = res.data.configs[i].id_n;
++			memcpy(pdc_list.configs[i].id, res.data.configs[i].id, res.data.configs[i].id_n);
++		}
++		pdc_list.n_configs = res.data.configs_n;
++
++		if (!pdc_list.n_configs) {
++			pdc_list_print();
++			qmi_indication_done(qmi, 0);
++			return;
++		}
++
++		pdc_list.step = PDC_LIST_STEP_INFO;
++		pdc_list.cur = 0;
++		pdc_list_request_info(qmi);
++	} else if (id == PDC_IND_GET_CONFIG_INFO && pdc_list.step == PDC_LIST_STEP_INFO) {
++		struct qmi_pdc_get_config_info_indication res;
++		struct pdc_list_config *cfg = &pdc_list.configs[pdc_list.cur];
++
++		qmi_parse_pdc_get_config_info_indication(msg, &res);
++		if (!pdc_token_valid(res.set.token, res.data.token, pdc_token))
++			return;
++
++		if (res.set.indication_result && res.data.indication_result) {
++			pdc_fail(qmi, qmi_get_error_str(res.data.indication_result));
++			return;
++		}
++
++		cfg->size = res.data.total_size;
++		cfg->version = res.data.version;
++		if (res.data.description)
++			cfg->description = strdup(res.data.description);
++
++		if (++pdc_list.cur < pdc_list.n_configs) {
++			pdc_list_request_info(qmi);
++			return;
++		}
++
++		pdc_list_print();
++		qmi_indication_done(qmi, 0);
++	}
++}
++
++#define cmd_pdc_list_configs_cb no_cb
++static enum qmi_cmd_result
++cmd_pdc_list_configs_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_pdc_get_selected_config_request data = {
++		QMI_INIT(config_type, pdc_config_type),
++		QMI_INIT(token, ++pdc_token),
++	};
++
++	pdc_list_free();
++	qmi_set_pdc_get_selected_config_request(msg, &data);
++	qmi_indication_listen(qmi, QMI_SERVICE_PDC, pdc_list_ind, PDC_IND_TIMEOUT);
++	return QMI_CMD_REQUEST;
++}
++
++/* --pdc-load-config */
++
++static struct {
++	uint8_t *data;
++	size_t size;
++	size_t offset;
++	uint8_t id[PDC_ID_MAX];
++	unsigned int id_n;
++} pdc_load;
++
++static void pdc_load_request_chunk(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	size_t len = pdc_load.size - pdc_load.offset;
++	struct qmi_pdc_load_config_request data;
++
++	if (len > PDC_LOAD_CHUNK_SIZE)
++		len = PDC_LOAD_CHUNK_SIZE;
++
++	data = (struct qmi_pdc_load_config_request) {
++		QMI_INIT_SEQUENCE(config_chunk,
++			.type = pdc_config_type,
++			.id_n = pdc_load.id_n,
++			.id = pdc_load.id,
++			.total_size = pdc_load.size,
++			.chunk_n = len,
++			.chunk = pdc_load.data + pdc_load.offset
++		),
++		QMI_INIT(token, ++pdc_token),
++	};
++
++	qmi_set_pdc_load_config_request(msg, &data);
++	pdc_load.offset += len;
++}
++
++static void pdc_load_ind(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	struct qmi_pdc_load_config_indication res;
++	void *c;
++
++	if (!msg) {
++		pdc_fail(qmi, "Timed out waiting for indication");
++		return;
++	}
++
++	if (pdc_ind_id(msg) != PDC_IND_LOAD_CONFIG)
++		return;
++
++	qmi_parse_pdc_load_config_indication(msg, &res);
++	if (!pdc_token_valid(res.set.token, res.data.token, pdc_token))
++		return;
++
++	if (res.set.indication_result && res.data.indication_result) {
++		pdc_fail(qmi, qmi_get_error_str(res.data.indication_result));
++		return;
++	}
++
++	if (res.set.frame_reset && res.data.frame_reset) {
++		pdc_fail(qmi, "Frame reset requested by modem");
++		return;
++	}
++
++	if (!res.set.remaining_size) {
++		pdc_fail(qmi, "Invalid indication");
++		return;
++	}
++
++	if (res.data.remaining_size) {
++		if (pdc_load.offset >= pdc_load.size) {
++			pdc_fail(qmi, "Modem expects more data than the file contains");
++			return;
++		}
++
++		pdc_load_request_chunk(qmi, qmi->buf);
++		pdc_send_request(qmi);
++		return;
++	}
++
++	c = blobmsg_open_table(&status, NULL);
++	blobmsg_add_string(&status, "type", pdc_type_name(pdc_config_type));
++	pdc_add_id("id", pdc_load.id, pdc_load.id_n);
++	blobmsg_add_u32(&status, "size", pdc_load.size);
++	blobmsg_close_table(&status, c);
++
++	qmi_indication_done(qmi, 0);
++}
++
++#define cmd_pdc_load_config_cb no_cb
++static enum qmi_cmd_result
++cmd_pdc_load_config_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	FILE *f = fopen(arg, "rb");
++	long size;
++
++	free(pdc_load.data);
++	memset(&pdc_load, 0, sizeof(pdc_load));
++
++	if (!f) {
++		uqmi_add_error("Failed to open file");
++		return QMI_CMD_EXIT;
++	}
++
++	if (fseek(f, 0, SEEK_END) || (size = ftell(f)) <= 0 || size > PDC_LOAD_SIZE_MAX ||
++	    fseek(f, 0, SEEK_SET)) {
++		fclose(f);
++		uqmi_add_error("Invalid file size");
++		return QMI_CMD_EXIT;
++	}
++
++	pdc_load.data = malloc(size);
++	if (!pdc_load.data || fread(pdc_load.data, 1, size, f) != (size_t) size) {
++		fclose(f);
++		free(pdc_load.data);
++		pdc_load.data = NULL;
++		uqmi_add_error("Failed to read file");
++		return QMI_CMD_EXIT;
++	}
++	fclose(f);
++
++	pdc_load.size = size;
++	pdc_load.id_n = pdc_id_from_file(pdc_load.id, pdc_load.data, pdc_load.size);
++
++	pdc_load_request_chunk(qmi, msg);
++	qmi_indication_listen(qmi, QMI_SERVICE_PDC, pdc_load_ind, PDC_IND_TIMEOUT);
++	return QMI_CMD_REQUEST;
++}
++
++/* --pdc-activate-config */
++
++static struct {
++	enum {
++		PDC_ACTIVATE_STEP_SELECT,
++		PDC_ACTIVATE_STEP_ACTIVATE,
++	} step;
++	uint8_t id[PDC_ID_MAX];
++	unsigned int id_n;
++} pdc_activate;
++
++static void pdc_activate_print(const char *status_str)
++{
++	void *c = blobmsg_open_table(&status, NULL);
++
++	blobmsg_add_string(&status, "type", pdc_type_name(pdc_config_type));
++	pdc_add_id("id", pdc_activate.id, pdc_activate.id_n);
++	blobmsg_add_string(&status, "status", status_str);
++	blobmsg_close_table(&status, c);
++}
++
++static void pdc_activate_ind(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	uint16_t id;
++
++	if (!msg) {
++		/* The modem restarts to apply the configuration, the indication
++		 * might never arrive. */
++		if (pdc_activate.step == PDC_ACTIVATE_STEP_ACTIVATE) {
++			pdc_activate_print("activation-requested");
++			qmi_indication_done(qmi, 0);
++		} else {
++			pdc_fail(qmi, "Timed out waiting for indication");
++		}
++		return;
++	}
++
++	id = pdc_ind_id(msg);
++	if (id == PDC_IND_SET_SELECTED_CONFIG && pdc_activate.step == PDC_ACTIVATE_STEP_SELECT) {
++		struct qmi_pdc_set_selected_config_indication res;
++		struct qmi_pdc_activate_config_request data = {
++			QMI_INIT(config_type, pdc_config_type),
++			QMI_INIT(token, 0),
++		};
++
++		qmi_parse_pdc_set_selected_config_indication(msg, &res);
++		if (!pdc_token_valid(res.set.token, res.data.token, pdc_token))
++			return;
++
++		if (res.set.indication_result && res.data.indication_result) {
++			pdc_fail(qmi, qmi_get_error_str(res.data.indication_result));
++			return;
++		}
++
++		pdc_activate.step = PDC_ACTIVATE_STEP_ACTIVATE;
++		data.data.token = ++pdc_token;
++		qmi_set_pdc_activate_config_request(qmi->buf, &data);
++		pdc_send_request(qmi);
++	} else if (id == PDC_IND_ACTIVATE_CONFIG && pdc_activate.step == PDC_ACTIVATE_STEP_ACTIVATE) {
++		struct qmi_pdc_activate_config_indication res;
++
++		qmi_parse_pdc_activate_config_indication(msg, &res);
++		if (!pdc_token_valid(res.set.token, res.data.token, pdc_token))
++			return;
++
++		if (res.set.indication_result && res.data.indication_result) {
++			pdc_fail(qmi, qmi_get_error_str(res.data.indication_result));
++			return;
++		}
++
++		pdc_activate_print("activation-requested");
++		qmi_indication_done(qmi, 0);
++	}
++}
++
++#define cmd_pdc_activate_config_cb no_cb
++static enum qmi_cmd_result
++cmd_pdc_activate_config_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_pdc_set_selected_config_request data = {
++		QMI_INIT_SEQUENCE(type_with_id_v2,
++			.config_type = pdc_config_type,
++			.id = pdc_activate.id
++		),
++		QMI_INIT(token, ++pdc_token),
++	};
++
++	memset(&pdc_activate, 0, sizeof(pdc_activate));
++	if (!pdc_id_parse(arg, pdc_activate.id, &pdc_activate.id_n)) {
++		uqmi_add_error("Invalid configuration ID (expected hex string)");
++		return QMI_CMD_EXIT;
++	}
++
++	data.data.type_with_id_v2.id_n = pdc_activate.id_n;
++	qmi_set_pdc_set_selected_config_request(msg, &data);
++	qmi_indication_listen(qmi, QMI_SERVICE_PDC, pdc_activate_ind, PDC_IND_TIMEOUT);
++	return QMI_CMD_REQUEST;
++}
++
++/* --pdc-deactivate-config */
++
++static void pdc_deactivate_ind(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	struct qmi_pdc_deactivate_config_indication res;
++	void *c;
++
++	if (!msg) {
++		pdc_fail(qmi, "Timed out waiting for indication");
++		return;
++	}
++
++	if (pdc_ind_id(msg) != PDC_IND_DEACTIVATE_CONFIG)
++		return;
++
++	qmi_parse_pdc_deactivate_config_indication(msg, &res);
++	if (!pdc_token_valid(res.set.token, res.data.token, pdc_token))
++		return;
++
++	if (res.set.indication_result && res.data.indication_result) {
++		pdc_fail(qmi, qmi_get_error_str(res.data.indication_result));
++		return;
++	}
++
++	c = blobmsg_open_table(&status, NULL);
++	blobmsg_add_string(&status, "type", pdc_type_name(pdc_config_type));
++	blobmsg_add_string(&status, "status", "deactivation-requested");
++	blobmsg_close_table(&status, c);
++
++	qmi_indication_done(qmi, 0);
++}
++
++#define cmd_pdc_deactivate_config_cb no_cb
++static enum qmi_cmd_result
++cmd_pdc_deactivate_config_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_pdc_deactivate_config_request data = {
++		QMI_INIT(config_type, pdc_config_type),
++		QMI_INIT(token, ++pdc_token),
++	};
++
++	qmi_set_pdc_deactivate_config_request(msg, &data);
++	qmi_indication_listen(qmi, QMI_SERVICE_PDC, pdc_deactivate_ind, PDC_IND_TIMEOUT);
++	return QMI_CMD_REQUEST;
++}
++
++/* --pdc-delete-config */
++
++#define cmd_pdc_delete_config_cb no_cb
++static enum qmi_cmd_result
++cmd_pdc_delete_config_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_pdc_delete_config_request data = {
++		QMI_INIT(config_type, pdc_config_type),
++		QMI_INIT(token, ++pdc_token),
++	};
++	uint8_t id[PDC_ID_MAX];
++	unsigned int id_n;
++
++	if (!pdc_id_parse(arg, id, &id_n)) {
++		uqmi_add_error("Invalid configuration ID (expected hex string)");
++		return QMI_CMD_EXIT;
++	}
++
++	qmi_set_ptr(&data, id, id);
++	data.data.id_n = id_n;
++	qmi_set_pdc_delete_config_request(msg, &data);
++	return QMI_CMD_REQUEST;
++}
+--- /dev/null
++++ b/uqmi/commands-pdc.h
+@@ -0,0 +1,43 @@
++/*
++ * uqmi -- tiny QMI support implementation
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++ * Boston, MA 02110-1301 USA.
++ */
++
++#define __uqmi_pdc_commands												\
++	__uqmi_command(pdc_config_type, pdc-config-type, required, CMD_TYPE_OPTION), \
++	__uqmi_command(pdc_list_configs, pdc-list-configs, no, QMI_SERVICE_PDC), \
++	__uqmi_command(pdc_get_selected_config, pdc-get-selected-config, no, QMI_SERVICE_PDC), \
++	__uqmi_command(pdc_load_config, pdc-load-config, required, QMI_SERVICE_PDC), \
++	__uqmi_command(pdc_activate_config, pdc-activate-config, required, QMI_SERVICE_PDC), \
++	__uqmi_command(pdc_deactivate_config, pdc-deactivate-config, no, QMI_SERVICE_PDC), \
++	__uqmi_command(pdc_delete_config, pdc-delete-config, required, QMI_SERVICE_PDC) \
++
++#define pdc_helptext \
++		"  --pdc-list-configs:               List stored modem configurations (MCFG/MBN)\n" \
++		"    --pdc-config-type <type>:       Configuration type (software, platform; default: software)\n" \
++		"  --pdc-get-selected-config:        Get active and pending configuration ID\n" \
++		"    --pdc-config-type <type>:       Configuration type (software, platform; default: software)\n" \
++		"  --pdc-load-config <file>:         Load a configuration (MBN) file into the modem\n" \
++		"                                    (ID is the SHA1 of the file; waits for the modem to confirm each chunk)\n" \
++		"    --pdc-config-type <type>:       Configuration type (software, platform; default: software)\n" \
++		"  --pdc-activate-config <id>:       Select and activate the configuration with hex ID (resets the modem)\n" \
++		"    --pdc-config-type <type>:       Configuration type (software, platform; default: software)\n" \
++		"  --pdc-deactivate-config:          Deactivate the current configuration\n" \
++		"    --pdc-config-type <type>:       Configuration type (software, platform; default: software)\n" \
++		"  --pdc-delete-config <id>:         Delete the configuration with hex ID\n" \
++		"    --pdc-config-type <type>:       Configuration type (software, platform; default: software)\n" \
++
+--- a/uqmi/commands-uim.c
++++ b/uqmi/commands-uim.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "qmi-message.h"
++#include "ext-fmt.h"
+ 
+ static int uim_slot = 0;
+ static int channel_id = -1;
+@@ -66,69 +67,9 @@ static void cmd_uim_get_sim_state_cb(struct qmi_dev *qmi, struct qmi_request *re
+ {
+ 	struct qmi_uim_get_card_status_response res;
+ 	void * const card_table = blobmsg_open_table(&status, NULL);
+-	static const char *card_application_states[] = {
+-		[QMI_UIM_CARD_APPLICATION_STATE_UNKNOWN] = "unknown",
+-		[QMI_UIM_CARD_APPLICATION_STATE_DETECTED] = "detected",
+-		[QMI_UIM_CARD_APPLICATION_STATE_PIN1_OR_UPIN_PIN_REQUIRED] = "pin-required",
+-		[QMI_UIM_CARD_APPLICATION_STATE_PUK1_OR_UPIN_PUK_REQUIRED] = "puk-required",
+-		[QMI_UIM_CARD_APPLICATION_STATE_CHECK_PERSONALIZATION_STATE] = "check-personalization-state",
+-		[QMI_UIM_CARD_APPLICATION_STATE_PIN1_BLOCKED] = "pin1-blocked",
+-		[QMI_UIM_CARD_APPLICATION_STATE_ILLEGAL] = "illegal",
+-		[QMI_UIM_CARD_APPLICATION_STATE_READY] = "ready",
+-	};
+ 
+ 	qmi_parse_uim_get_card_status_response(msg, &res);
+-
+-	for (int i = 0; i < res.data.card_status.cards_n; ++i) {
+-		if (res.data.card_status.cards[i].card_state != QMI_UIM_CARD_STATE_PRESENT)
+-			continue;
+-
+-		uint8_t card_application_state = QMI_UIM_CARD_APPLICATION_STATE_UNKNOWN;
+-		uint8_t pin1_state = res.data.card_status.cards[i].upin_state;
+-		uint8_t pin1_retries = res.data.card_status.cards[i].upin_retries;
+-		uint8_t puk1_retries = res.data.card_status.cards[i].upuk_retries;
+-		uint8_t pin2_state;
+-		uint8_t pin2_retries;
+-		uint8_t puk2_retries;
+-		bool has_pin2 = false;
+-
+-		for (int j = 0; j < res.data.card_status.cards[i].applications_n; ++j) {
+-			if (res.data.card_status.cards[i].applications[j].type == QMI_UIM_CARD_APPLICATION_TYPE_UNKNOWN)
+-				continue;
+-
+-			card_application_state = pin1_state = res.data.card_status.cards[i].applications[j].state;
+-
+-			if (!res.data.card_status.cards[i].applications[j].upin_replaces_pin1) {
+-				pin1_state = res.data.card_status.cards[i].applications[j].pin1_state;
+-				pin1_retries = res.data.card_status.cards[i].applications[j].pin1_retries;
+-				puk1_retries = res.data.card_status.cards[i].applications[j].puk1_retries;
+-			}
+-
+-			pin2_state = res.data.card_status.cards[i].applications[j].pin2_state;
+-			pin2_retries = res.data.card_status.cards[i].applications[j].pin2_retries;
+-			puk2_retries = res.data.card_status.cards[i].applications[j].puk2_retries;
+-			has_pin2 = true;
+-
+-			break; /* handle first application only for now */
+-		}
+-
+-		if (card_application_state > QMI_UIM_CARD_APPLICATION_STATE_READY)
+-			card_application_state = QMI_UIM_CARD_APPLICATION_STATE_UNKNOWN;
+-
+-		blobmsg_add_u32(&status, "card_slot", i + 1); /* Slot is idx + 1 */
+-		blobmsg_add_string(&status, "card_application_state", card_application_states[card_application_state]);
+-		blobmsg_add_string(&status, "pin1_status", get_pin_status(pin1_state));
+-		blobmsg_add_u32(&status, "pin1_verify_tries", pin1_retries);
+-		blobmsg_add_u32(&status, "pin1_unlock_tries", puk1_retries);
+-		if (has_pin2) {
+-			blobmsg_add_string(&status, "pin2_status", get_pin_status(pin2_state));
+-			blobmsg_add_u32(&status, "pin2_verify_tries", pin2_retries);
+-			blobmsg_add_u32(&status, "pin2_unlock_tries", puk2_retries);
+-		}
+-
+-		break; /* handle only first preset SIM card for now */
+-	}
+-
++	ext_fmt_uim_sim_state(&status, &res);
+ 	blobmsg_close_table(&status, card_table);
+ }
+ 
+--- /dev/null
++++ b/uqmi/commands-voice.c
+@@ -0,0 +1,325 @@
++/*
++ * uqmi -- tiny QMI support implementation
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++ * Boston, MA 02110-1301 USA.
++ */
++
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "qmi-message.h"
++#include "voice-util.h"
++
++#define VOICE_IND_ALL_CALL_STATUS	0x002e
++
++/* Adds a "calls" array to the blob buffer; shared by get-all-call-info and the indications */
++static void voice_add_calls(struct blob_buf *b, const char *name,
++			    const struct voice_call_info *calls, unsigned int n_calls,
++			    const struct voice_call_number *numbers, unsigned int n_numbers)
++{
++	unsigned int i, j;
++	void *a, *c;
++
++	a = blobmsg_open_array(b, name);
++	for (i = 0; i < n_calls; i++) {
++		c = blobmsg_open_table(b, NULL);
++		blobmsg_add_u32(b, "id", calls[i].id);
++		blobmsg_add_string(b, "state", voice_call_state_name(calls[i].state));
++		blobmsg_add_string(b, "type", voice_call_type_name(calls[i].type));
++		blobmsg_add_string(b, "direction", voice_call_direction_name(calls[i].direction));
++		blobmsg_add_string(b, "mode", voice_call_mode_name(calls[i].mode));
++		for (j = 0; j < n_numbers; j++) {
++			if (numbers[j].id != calls[i].id || !numbers[j].number ||
++			    !numbers[j].number[0])
++				continue;
++
++			blobmsg_add_string(b, "number", numbers[j].number);
++			break;
++		}
++		blobmsg_close_table(b, c);
++	}
++	blobmsg_close_array(b, a);
++}
++
++static bool voice_parse_id(const char *arg, char **end, uint8_t *id)
++{
++	unsigned long val;
++
++	if (!arg[0])
++		return false;
++
++	val = strtoul(arg, end, 0);
++	if (*end == arg || val > 0xff)
++		return false;
++
++	*id = val;
++	return true;
++}
++
++static bool voice_parse_id_arg(char *arg, uint8_t *id)
++{
++	char *end;
++
++	if (voice_parse_id(arg, &end, id) && !*end)
++		return true;
++
++	uqmi_add_error("Invalid call ID");
++	return false;
++}
++
++/* Splits "<id>,<value>" and returns the value part */
++static char *voice_parse_id_value(char *arg, uint8_t *id)
++{
++	char *end;
++
++	if (!voice_parse_id(arg, &end, id) || *end != ',' || !end[1]) {
++		uqmi_add_error("Invalid argument (expected <id>,<value>)");
++		return NULL;
++	}
++
++	return end + 1;
++}
++
++/* --voice-dial */
++
++static void
++cmd_voice_dial_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
++{
++	struct qmi_voice_dial_call_response res;
++
++	qmi_parse_voice_dial_call_response(msg, &res);
++	if (res.set.call_id)
++		blobmsg_add_u32(&status, NULL, res.data.call_id);
++}
++
++static enum qmi_cmd_result
++cmd_voice_dial_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	/* keep call status indications arriving before --voice-indications runs */
++	qmi_indication_buffer(qmi, QMI_SERVICE_VOICE);
++	struct qmi_voice_dial_call_request data = {
++		QMI_INIT_PTR(calling_number, arg),
++	};
++
++	qmi_set_voice_dial_call_request(msg, &data);
++	return QMI_CMD_REQUEST;
++}
++
++/* --voice-end-call */
++
++#define cmd_voice_end_call_cb no_cb
++static enum qmi_cmd_result
++cmd_voice_end_call_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	/* keep call status indications arriving before --voice-indications runs */
++	qmi_indication_buffer(qmi, QMI_SERVICE_VOICE);
++	struct qmi_voice_end_call_request data = {};
++	uint8_t id;
++
++	if (!voice_parse_id_arg(arg, &id))
++		return QMI_CMD_EXIT;
++
++	qmi_set(&data, call_id, id);
++	qmi_set_voice_end_call_request(msg, &data);
++	return QMI_CMD_REQUEST;
++}
++
++/* --voice-answer-call */
++
++#define cmd_voice_answer_call_cb no_cb
++static enum qmi_cmd_result
++cmd_voice_answer_call_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	/* keep call status indications arriving before --voice-indications runs */
++	qmi_indication_buffer(qmi, QMI_SERVICE_VOICE);
++	struct qmi_voice_answer_call_request data = {};
++	uint8_t id;
++
++	if (!voice_parse_id_arg(arg, &id))
++		return QMI_CMD_EXIT;
++
++	qmi_set(&data, call_id, id);
++	qmi_set_voice_answer_call_request(msg, &data);
++	return QMI_CMD_REQUEST;
++}
++
++/* --voice-get-all-call-info */
++
++static void
++cmd_voice_get_all_call_info_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
++{
++	struct qmi_voice_get_all_call_info_response res;
++	struct voice_call_info calls[VOICE_MAX_CALLS];
++	struct voice_call_number numbers[VOICE_MAX_CALLS];
++	unsigned int i, n_calls, n_numbers;
++
++	qmi_parse_voice_get_all_call_info_response(msg, &res);
++
++	n_calls = res.data.call_information_n;
++	if (n_calls > ARRAY_SIZE(calls))
++		n_calls = ARRAY_SIZE(calls);
++	for (i = 0; i < n_calls; i++) {
++		calls[i].id = res.data.call_information[i].id;
++		calls[i].state = res.data.call_information[i].state;
++		calls[i].type = res.data.call_information[i].type;
++		calls[i].direction = res.data.call_information[i].direction;
++		calls[i].mode = res.data.call_information[i].mode;
++	}
++
++	n_numbers = res.data.remote_party_number_n;
++	if (n_numbers > ARRAY_SIZE(numbers))
++		n_numbers = ARRAY_SIZE(numbers);
++	for (i = 0; i < n_numbers; i++) {
++		numbers[i].id = res.data.remote_party_number[i].id;
++		numbers[i].number = res.data.remote_party_number[i].type;
++	}
++
++	voice_add_calls(&status, NULL, calls, n_calls, numbers, n_numbers);
++}
++
++static enum qmi_cmd_result
++cmd_voice_get_all_call_info_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	qmi_set_voice_get_all_call_info_request(msg);
++	return QMI_CMD_REQUEST;
++}
++
++/* --voice-burst-dtmf */
++
++#define cmd_voice_burst_dtmf_cb no_cb
++static enum qmi_cmd_result
++cmd_voice_burst_dtmf_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_voice_burst_dtmf_request data = {};
++	uint8_t id;
++	char *digits;
++
++	digits = voice_parse_id_value(arg, &id);
++	if (!digits)
++		return QMI_CMD_EXIT;
++
++	if (strlen(digits) > 0xff) {
++		uqmi_add_error("Too many digits");
++		return QMI_CMD_EXIT;
++	}
++
++	data.set.data = 1;
++	data.data.data.call_id = id;
++	data.data.data.digit_buffer = digits;
++	qmi_set_voice_burst_dtmf_request(msg, &data);
++	return QMI_CMD_REQUEST;
++}
++
++/* --voice-start-dtmf */
++
++#define cmd_voice_start_dtmf_cb no_cb
++static enum qmi_cmd_result
++cmd_voice_start_dtmf_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_voice_start_continuous_dtmf_request data = {};
++	uint8_t id;
++	char *digit;
++
++	digit = voice_parse_id_value(arg, &id);
++	if (!digit)
++		return QMI_CMD_EXIT;
++
++	if (digit[1]) {
++		uqmi_add_error("Only a single digit is allowed");
++		return QMI_CMD_EXIT;
++	}
++
++	data.set.data = 1;
++	data.data.data.call_id = id;
++	data.data.data.digit = digit[0];
++	qmi_set_voice_start_continuous_dtmf_request(msg, &data);
++	return QMI_CMD_REQUEST;
++}
++
++/* --voice-stop-dtmf */
++
++#define cmd_voice_stop_dtmf_cb no_cb
++static enum qmi_cmd_result
++cmd_voice_stop_dtmf_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_voice_stop_continuous_dtmf_request data = {};
++	uint8_t id;
++
++	if (!voice_parse_id_arg(arg, &id))
++		return QMI_CMD_EXIT;
++
++	data.set.data = 1;
++	data.data.data.call_id = id;
++	qmi_set_voice_stop_continuous_dtmf_request(msg, &data);
++	return QMI_CMD_REQUEST;
++}
++
++/*
++ * --voice-indications
++ *
++ * Prints each All Call Status indication as a single JSON line on stdout:
++ *   {"event":"all_call_status","calls":[{"id":1,"state":"incoming",
++ *    "type":"voice","direction":"mt","mode":"lte","number":"0123"}]}
++ * "number" is only present if the modem reported the remote party number.
++ * An empty "calls" array is possible. Runs until -t expires or SIGINT/SIGTERM.
++ */
++
++static struct blob_buf voice_ind_buf;
++
++static void voice_all_call_status_ind(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	struct voice_all_calls ind;
++	char *str;
++
++	if (!msg) {
++		/* -t expired, signalled, or (practically never) idle for too long */
++		qmi_indication_done(qmi, 0);
++		return;
++	}
++
++	if (le16_to_cpu(msg->svc.message) != VOICE_IND_ALL_CALL_STATUS)
++		return;
++
++	/* missing call information prints an empty "calls" array */
++	voice_parse_all_call_status(msg, &ind);
++
++	blob_buf_init(&voice_ind_buf, 0);
++	blobmsg_add_string(&voice_ind_buf, "event", "all_call_status");
++	voice_add_calls(&voice_ind_buf, "calls", ind.calls, ind.n_calls, ind.numbers, ind.n_numbers);
++
++	str = blobmsg_format_json_indent(voice_ind_buf.head, true, -1);
++	if (str) {
++		printf("%s\n", str);
++		fflush(stdout);
++		free(str);
++	}
++}
++
++#define cmd_voice_indications_cb no_cb
++static enum qmi_cmd_result
++cmd_voice_indications_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
++{
++	struct qmi_voice_indication_register_request data = {
++		QMI_INIT(call_notification_events, true),
++	};
++
++	qmi_set_voice_indication_register_request(msg, &data);
++	/* the per-indication idle timeout is effectively disabled, -t ends the wait */
++	qmi_indication_listen(qmi, QMI_SERVICE_VOICE, voice_all_call_status_ind, INT_MAX);
++	return QMI_CMD_REQUEST;
++}
+--- /dev/null
++++ b/uqmi/commands-voice.h
+@@ -0,0 +1,43 @@
++/*
++ * uqmi -- tiny QMI support implementation
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
++ * Boston, MA 02110-1301 USA.
++ */
++
++#define __uqmi_voice_commands \
++	__uqmi_command(voice_dial, voice-dial, required, QMI_SERVICE_VOICE), \
++	__uqmi_command(voice_end_call, voice-end-call, required, QMI_SERVICE_VOICE), \
++	__uqmi_command(voice_answer_call, voice-answer-call, required, QMI_SERVICE_VOICE), \
++	__uqmi_command(voice_get_all_call_info, voice-get-all-call-info, no, QMI_SERVICE_VOICE), \
++	__uqmi_command(voice_burst_dtmf, voice-burst-dtmf, required, QMI_SERVICE_VOICE), \
++	__uqmi_command(voice_start_dtmf, voice-start-dtmf, required, QMI_SERVICE_VOICE), \
++	__uqmi_command(voice_stop_dtmf, voice-stop-dtmf, required, QMI_SERVICE_VOICE), \
++	__uqmi_command(voice_indications, voice-indications, no, QMI_SERVICE_VOICE)
++
++#define voice_helptext \
++		"  --voice-dial <number>:            Dial a call, prints the call ID\n" \
++		"                                    The call is tied to the voice client: if it is released when\n" \
++		"                                    uqmi exits, the modem ends the call. For real calls run\n" \
++		"                                    --get-client-id voice once and pass --set-client-id voice,<cid>\n" \
++		"                                    to dial/answer/end (same convention as wds)\n" \
++		"  --voice-end-call <id>:            End the call with the given ID\n" \
++		"  --voice-answer-call <id>:         Answer the incoming call with the given ID\n" \
++		"  --voice-get-all-call-info:        List current calls (id, state, type, direction, mode, number)\n" \
++		"  --voice-burst-dtmf <id>,<digits>: Send a string of DTMF digits (0-9,*,#) on a call\n" \
++		"  --voice-start-dtmf <id>,<digit>:  Start playing a continuous DTMF digit on a call\n" \
++		"  --voice-stop-dtmf <id>:           Stop the continuous DTMF digit on a call\n" \
++		"  --voice-indications:              Register for call status and print one JSON line per\n" \
++		"                                    call status indication until stopped (use -t <msecs>)\n"
+--- a/uqmi/commands-wda.c
++++ b/uqmi/commands-wda.c
+@@ -22,26 +22,7 @@
+ #include <stdlib.h>
+ 
+ #include "qmi-message.h"
+-
+-static const struct {
+-	const char *name;
+-	QmiWdaLinkLayerProtocol val;
+-} link_modes[] = {
+-	{ "802.3", QMI_WDA_LINK_LAYER_PROTOCOL_802_3 },
+-	{ "raw-ip", QMI_WDA_LINK_LAYER_PROTOCOL_RAW_IP },
+-};
+-
+-static const struct {
+-	const char *name;
+-	QmiWdaDataAggregationProtocol aggreg;
+-} aggregation_protocols[] = {
+-	{ "tlp", QMI_WDA_DATA_AGGREGATION_PROTOCOL_TLP },
+-	{ "qc-cm", QMI_WDA_DATA_AGGREGATION_PROTOCOL_QC_NCM },
+-	{ "mbim", QMI_WDA_DATA_AGGREGATION_PROTOCOL_MBIM },
+-	{ "rndis", QMI_WDA_DATA_AGGREGATION_PROTOCOL_RNDIS },
+-	{ "qmap", QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAP },
+-	{ "qmapv5", QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV5 },
+-};
++#include "ext-fmt.h"
+ 
+ static struct {
+ 	uint32_t max_size_dl;
+@@ -86,17 +67,9 @@ cmd_wda_set_data_format_send(struct qmi_msg *msg, QmiWdaLinkLayerProtocol link_l
+ static enum qmi_cmd_result
+ cmd_wda_set_data_format_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+ {
+-	QmiWdaLinkLayerProtocol link_layer_proto;
+-	int i;
++	int link_layer_proto;
+ 
+-	for (i = 0; i < ARRAY_SIZE(link_modes); i++) {
+-		if (strcasecmp(link_modes[i].name, arg) != 0)
+-			continue;
+-
+-		link_layer_proto = link_modes[i].val;
+-	}
+-
+-	if (link_layer_proto == QMI_WDA_LINK_LAYER_PROTOCOL_UNKNOWN) {
++	if (!wds_name_to_val(ext_wda_link_layer_names, ext_wda_link_layer_names_n, arg, true, &link_layer_proto)) {
+ 		uqmi_add_error("Invalid auth mode (valid: 802.3, raw-ip)");
+ 		return QMI_CMD_EXIT;
+ 	}
+@@ -112,11 +85,10 @@ static enum qmi_cmd_result cmd_wda_downlink_data_aggregation_protocol_prepare(
+ 	struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg,
+ 	char *arg)
+ {
+-	for (uint32_t i = 0; i < ARRAY_SIZE(aggregation_protocols); i++) {
+-		if (strcasecmp(aggregation_protocols[i].name, arg))
+-			continue;
++	int proto;
+ 
+-		wda_aggregation_info.aggregation_protocol_dl = aggregation_protocols[i].aggreg;
++	if (wds_name_to_val(ext_wda_aggregation_names, ext_wda_aggregation_names_n, arg, true, &proto)) {
++		wda_aggregation_info.aggregation_protocol_dl = proto;
+ 		return QMI_CMD_DONE;
+ 	}
+ 
+@@ -130,11 +102,10 @@ static enum qmi_cmd_result cmd_wda_uplink_data_aggregation_protocol_prepare(
+ 	struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg,
+ 	char *arg)
+ {
+-	for (uint32_t i = 0; i < ARRAY_SIZE(aggregation_protocols); i++) {
+-		if (strcasecmp(aggregation_protocols[i].name, arg))
+-			continue;
++	int proto;
+ 
+-		wda_aggregation_info.aggregation_protocol_ul = aggregation_protocols[i].aggreg;
++	if (wds_name_to_val(ext_wda_aggregation_names, ext_wda_aggregation_names_n, arg, true, &proto)) {
++		wda_aggregation_info.aggregation_protocol_ul = proto;
+ 		return QMI_CMD_DONE;
+ 	}
+ 
+@@ -208,26 +179,6 @@ static enum qmi_cmd_result cmd_wda_flow_control_prepare(
+ 	return QMI_CMD_DONE;
+ }
+ 
+-static const char *
+-wda_link_layer_protocol_to_string(QmiWdaLinkLayerProtocol proto)
+-{
+-	for (int i = 0; i < ARRAY_SIZE(link_modes); i++) {
+-		if (link_modes[i].val == proto)
+-			return link_modes[i].name;
+-	}
+-	return "unknown";
+-}
+-
+-static const char *
+-wda_data_aggregation_protocol_to_string(QmiWdaDataAggregationProtocol proto)
+-{
+-	for (int i = 0; i < ARRAY_SIZE(aggregation_protocols); i++) {
+-		if (aggregation_protocols[i].aggreg == proto)
+-			return aggregation_protocols[i].name;
+-	}
+-	return "unknown";
+-}
+-
+ static void
+ cmd_wda_get_data_format_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
+ {
+@@ -236,24 +187,7 @@ cmd_wda_get_data_format_cb(struct qmi_dev *qmi, struct qmi_request *req, struct
+ 
+ 	qmi_parse_wda_get_data_format_response(msg, &res);
+ 	root = blobmsg_open_table(&status, NULL);
+-	blobmsg_add_u8(&status, "qos-format", res.data.qos_format);
+-	blobmsg_add_string(&status, "link-layer-protocol",
+-			   wda_link_layer_protocol_to_string(res.data.link_layer_protocol));
+-	blobmsg_add_string(&status, "data-aggregation-protocol",
+-			   wda_data_aggregation_protocol_to_string(res.data.uplink_data_aggregation_protocol));
+-	blobmsg_add_u32(&status, "uplink-data-aggregation-max-datagrams",
+-			res.data.uplink_data_aggregation_max_datagrams);
+-	blobmsg_add_u32(&status, "uplink-data-aggregation-max-size",
+-			res.data.uplink_data_aggregation_max_size);
+-	blobmsg_add_string(&status, "downlink-data-aggregation-protocol",
+-			   wda_data_aggregation_protocol_to_string(res.data.downlink_data_aggregation_protocol));
+-	blobmsg_add_u32(&status, "downlink-data-aggregation-max-datagrams",
+-			res.data.downlink_data_aggregation_max_datagrams);
+-	blobmsg_add_u32(&status, "downlink-data-aggregation-max-size",
+-			res.data.downlink_data_aggregation_max_size);
+-	blobmsg_add_u32(&status, "download-minimum-padding",
+-			res.data.download_minimum_padding);
+-	blobmsg_add_u8(&status, "flow-control", res.data.flow_control);
++	ext_fmt_wda_data_format(&status, &res);
+ 	blobmsg_close_table(&status, root);
+ }
+ 
+--- a/uqmi/commands-wds.c
++++ b/uqmi/commands-wds.c
+@@ -23,35 +23,7 @@
+ #include <arpa/inet.h>
+ 
+ #include "qmi-message.h"
+-
+-static const struct {
+-	const char *auth_name;
+-	QmiWdsAuthentication auth;
+-} auth_modes[] = {
+-	{ "none", QMI_WDS_AUTHENTICATION_NONE },
+-	{ "pap", QMI_WDS_AUTHENTICATION_PAP },
+-	{ "chap", QMI_WDS_AUTHENTICATION_CHAP },
+-	{ "both", QMI_WDS_AUTHENTICATION_PAP | QMI_WDS_AUTHENTICATION_CHAP },
+-};
+-
+-static const struct {
+-	const char *ipfam_name;
+-	const QmiWdsIpFamily mode;
+-} ipfam_modes[] = {
+-	{ "ipv4", QMI_WDS_IP_FAMILY_IPV4 },
+-	{ "ipv6", QMI_WDS_IP_FAMILY_IPV6 },
+-	{ "unspecified", QMI_WDS_IP_FAMILY_UNSPECIFIED },
+-};
+-
+-static const struct {
+-	const char *pdp_name;
+-	const QmiWdsPdpType type;
+-} pdp_types[] = {
+-	{ "ipv4", QMI_WDS_PDP_TYPE_IPV4 },
+-	{ "ppp", QMI_WDS_PDP_TYPE_PPP },
+-	{ "ipv6", QMI_WDS_PDP_TYPE_IPV6 },
+-	{ "ipv4v6", QMI_WDS_PDP_TYPE_IPV4_OR_IPV6 },
+-};
++#include "wds-util.h"
+ 
+ static const struct {
+ 	const char *profile_name;
+@@ -143,14 +115,12 @@ cmd_wds_set_apn_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi
+ static enum qmi_cmd_result
+ cmd_wds_set_auth_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+ {
+-	int i;
+-	for (i = 0; i < ARRAY_SIZE(auth_modes); i++) {
+-		if (strcasecmp(auth_modes[i].auth_name, arg) != 0)
+-			continue;
++	int auth;
+ 
+-		qmi_set(&wds_sn_req, authentication_preference, auth_modes[i].auth);
+-		qmi_set(&wds_mp_req, authentication, auth_modes[i].auth);
+-		qmi_set(&wds_cp_req, authentication, auth_modes[i].auth);
++	if (wds_name_to_val(wds_auth_names, wds_auth_names_n, arg, true, &auth)) {
++		qmi_set(&wds_sn_req, authentication_preference, auth);
++		qmi_set(&wds_mp_req, authentication, auth);
++		qmi_set(&wds_cp_req, authentication, auth);
+ 		return QMI_CMD_DONE;
+ 	}
+ 
+@@ -191,12 +161,10 @@ cmd_wds_set_autoconnect_prepare(struct qmi_dev *qmi, struct qmi_request *req, st
+ static enum qmi_cmd_result
+ cmd_wds_set_ip_family_pref_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+ {
+-	int i;
+-	for (i = 0; i < ARRAY_SIZE(ipfam_modes); i++) {
+-		if (strcasecmp(ipfam_modes[i].ipfam_name, arg) != 0)
+-			continue;
++	int mode;
+ 
+-		qmi_set(&wds_sn_req, ip_family_preference, ipfam_modes[i].mode);
++	if (wds_name_to_val(wds_ip_family_names, wds_ip_family_names_n, arg, true, &mode)) {
++		qmi_set(&wds_sn_req, ip_family_preference, mode);
+ 		return QMI_CMD_DONE;
+ 	}
+ 
+@@ -208,14 +176,11 @@ cmd_wds_set_ip_family_pref_prepare(struct qmi_dev *qmi, struct qmi_request *req,
+ static enum qmi_cmd_result
+ cmd_wds_set_pdp_type_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+ {
+-	int i;
++	int type;
+ 
+-	for (i = 0; i < ARRAY_SIZE(pdp_types); i++) {
+-		if (strcasecmp(pdp_types[i].pdp_name, arg) != 0)
+-			continue;
+-
+-		qmi_set(&wds_mp_req, pdp_type, pdp_types[i].type);
+-		qmi_set(&wds_cp_req, pdp_type, pdp_types[i].type);
++	if (wds_name_to_val(wds_pdp_type_names, wds_pdp_type_names_n, arg, true, &type)) {
++		qmi_set(&wds_mp_req, pdp_type, type);
++		qmi_set(&wds_cp_req, pdp_type, type);
+ 		return QMI_CMD_DONE;
+ 	}
+ 
+@@ -440,13 +405,10 @@ static enum qmi_cmd_result
+ cmd_wds_set_ip_family_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+ {
+ 	struct qmi_wds_set_ip_family_request ipf_req;
++	int mode;
+ 
+-	int i;
+-	for (i = 0; i < ARRAY_SIZE(ipfam_modes); i++) {
+-		if (strcasecmp(ipfam_modes[i].ipfam_name, arg) != 0)
+-			continue;
+-
+-		qmi_set(&ipf_req, preference, ipfam_modes[i].mode);
++	if (wds_name_to_val(wds_ip_family_names, wds_ip_family_names_n, arg, true, &mode)) {
++		qmi_set(&ipf_req, preference, mode);
+ 		qmi_set_wds_set_ip_family_request(msg, &ipf_req);
+ 		return QMI_CMD_REQUEST;
+ 	}
+@@ -481,6 +443,27 @@ cmd_wds_bind_mux_prepare(struct qmi_dev *qmi, struct qmi_request *req,
+ 	return QMI_CMD_REQUEST;
+ }
+ 
++#define cmd_wds_bind_data_port_cb no_cb
++
++static enum qmi_cmd_result
++cmd_wds_bind_data_port_prepare(struct qmi_dev *qmi, struct qmi_request *req,
++			       struct qmi_msg *msg, char *arg)
++{
++	struct qmi_wds_bind_data_port_request bind_req;
++	uint16_t port;
++
++	if (!wds_sio_port_parse(arg, &port))
++		goto error;
++
++	qmi_set(&bind_req, data_port, port);
++	qmi_set_wds_bind_data_port_request(msg, &bind_req);
++	return QMI_CMD_REQUEST;
++
++error:
++	uqmi_add_error("Invalid value (valid: a2-mux-rmnet<0-7> or SIO port number)");
++	return QMI_CMD_EXIT;
++}
++
+ #define cmd_wds_ep_iface_cb no_cb
+ 
+ static enum qmi_cmd_result
+@@ -513,23 +496,16 @@ cmd_wds_ep_type_prepare(struct qmi_dev *qmi, struct qmi_request *req,
+ 
+ static void wds_to_ipv4(const char *name, const uint32_t addr)
+ {
+-	struct in_addr ip_addr;
+ 	char buf[INET_ADDRSTRLEN];
+ 
+-	ip_addr.s_addr = htonl(addr);
+-	blobmsg_add_string(&status, name, inet_ntop(AF_INET, &ip_addr, buf, sizeof(buf)));
++	blobmsg_add_string(&status, name, wds_ipv4_to_str(addr, buf, sizeof(buf)));
+ }
+ 
+ static void wds_to_ipv6(const char *name, const uint16_t *addr)
+ {
+ 	char buf[INET6_ADDRSTRLEN];
+-	uint16_t ip_addr[8];
+-	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(ip_addr); i++)
+-		ip_addr[i] = htons(addr[i]);
+-
+-	blobmsg_add_string(&status, name, inet_ntop(AF_INET6, &ip_addr, buf, sizeof(buf)));
++	blobmsg_add_string(&status, name, wds_ipv6_to_str(addr, buf, sizeof(buf)));
+ }
+ 
+ static enum qmi_cmd_result
+@@ -557,7 +533,7 @@ static void
+ cmd_wds_get_profile_settings_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
+ {
+ 	struct qmi_wds_get_profile_settings_response res;
+-
++	const char *name;
+ 	void *p;
+ 
+ 	qmi_parse_wds_get_profile_settings_response(msg, &res);
+@@ -565,12 +541,12 @@ cmd_wds_get_profile_settings_cb(struct qmi_dev *qmi, struct qmi_request *req, st
+ 	p = blobmsg_open_table(&status, NULL);
+ 
+ 	blobmsg_add_string(&status, "apn", res.data.apn_name);
+-	if (res.set.pdp_type && (int) res.data.pdp_type < ARRAY_SIZE(pdp_types))
+-		blobmsg_add_string(&status, "pdp-type", pdp_types[res.data.pdp_type].pdp_name);
++	if (res.set.pdp_type && (name = wds_val_to_name(wds_pdp_type_names, wds_pdp_type_names_n, res.data.pdp_type)))
++		blobmsg_add_string(&status, "pdp-type", name);
+ 	blobmsg_add_string(&status, "username", res.data.username);
+ 	blobmsg_add_string(&status, "password", res.data.password);
+-        if (res.set.authentication && (int) res.data.authentication < ARRAY_SIZE(auth_modes))
+-                blobmsg_add_string(&status, "auth", auth_modes[res.data.authentication].auth_name);
++	if (res.set.authentication && (name = wds_val_to_name(wds_auth_names, wds_auth_names_n, res.data.authentication)))
++		blobmsg_add_string(&status, "auth", name);
+ 	blobmsg_add_u8(&status, "no-roaming", res.data.roaming_disallowed_flag);
+ 	blobmsg_add_u8(&status, "apn-disabled", res.data.apn_disabled_flag);
+ 	blobmsg_close_table(&status, p);
+@@ -581,23 +557,19 @@ cmd_wds_get_current_settings_cb(struct qmi_dev *qmi, struct qmi_request *req, st
+ {
+ 	void *v4, *v6, *d, *t;
+ 	struct qmi_wds_get_current_settings_response res;
++	const char *name;
+ 	int i;
+ 
+ 	qmi_parse_wds_get_current_settings_response(msg, &res);
+ 
+ 	t = blobmsg_open_table(&status, NULL);
+ 
+-	if (res.set.pdp_type && (int) res.data.pdp_type < ARRAY_SIZE(pdp_types))
+-		blobmsg_add_string(&status, "pdp-type", pdp_types[res.data.pdp_type].pdp_name);
++	if (res.set.pdp_type && (name = wds_val_to_name(wds_pdp_type_names, wds_pdp_type_names_n, res.data.pdp_type)))
++		blobmsg_add_string(&status, "pdp-type", name);
+ 
+-	if (res.set.ip_family) {
+-		for (i = 0; i < ARRAY_SIZE(ipfam_modes); i++) {
+-			if (ipfam_modes[i].mode != res.data.ip_family)
+-				continue;
+-			blobmsg_add_string(&status, "ip-family", ipfam_modes[i].ipfam_name);
+-			break;
+-		}
+-	}
++	if (res.set.ip_family &&
++	    (name = wds_val_to_name(wds_ip_family_names, wds_ip_family_names_n, res.data.ip_family)))
++		blobmsg_add_string(&status, "ip-family", name);
+ 
+ 	if (res.set.mtu)
+ 		blobmsg_add_u32(&status, "mtu", res.data.mtu);
+--- a/uqmi/commands-wds.h
++++ b/uqmi/commands-wds.h
+@@ -43,6 +43,7 @@
+ 	__uqmi_command(wds_set_pdp_type, pdp-type, required, CMD_TYPE_OPTION), \
+ 	__uqmi_command(wds_no_roaming, no-roaming, required, CMD_TYPE_OPTION), \
+ 	__uqmi_command(wds_get_current_settings, get-current-settings, no, QMI_SERVICE_WDS), \
++	__uqmi_command(wds_bind_data_port, bind-data-port, required, QMI_SERVICE_WDS), \
+ 	__uqmi_command(wds_bind_mux, bind-mux, required, QMI_SERVICE_WDS), \
+ 	__uqmi_command(wds_ep_type, endpoint-type, required, CMD_TYPE_OPTION), \
+ 	__uqmi_command(wds_ep_iface, endpoint-iface, required, CMD_TYPE_OPTION), \
+@@ -83,6 +84,7 @@
+ 		"    --no-roaming false|true         To allow roaming, set to false\n" \
+ 		"  --delete-profile <val>,#:         Delete profile number (3gpp, 3gpp2)\n" \
+ 		"  --get-current-settings:           Get current connection settings\n" \
++		"  --bind-data-port <port>:          Bind data session to SIO data port (a2-mux-rmnet<0-7>, or number)\n" \
+ 		"  --bind-mux <id>:                  Bind data session to QMAP multiplex (use with options below)\n" \
+ 		"    --endpoint-type <type>:         Set endpoint interface type (hsusb, pcie)\n" \
+ 		"    --endpoint-iface <number>:      Set endpoint interface number\n" \
+--- a/uqmi/commands-wms.c
++++ b/uqmi/commands-wms.c
+@@ -19,10 +19,12 @@
+  * Boston, MA 02110-1301 USA.
+  */
+ 
+-#include "qmi-message.h"
++#include <time.h>
++#include <unistd.h>
+ 
+-#define MIN(a,b) (((a)<(b))?(a):(b))
+-#define CEILDIV(x,y) (((x) + (y) - 1) / (y))
++#include "qmi-message.h"
++#include "sms_part.h"
++#include "sms-json.h"
+ 
+ static struct qmi_wms_list_messages_request lmreq = {
+ 	QMI_INIT(storage_type, QMI_WMS_STORAGE_TYPE_UIM),
+@@ -80,234 +82,6 @@ cmd_wms_list_messages_prepare(struct qmi_dev *qmi, struct qmi_request *req, stru
+ 	return QMI_CMD_REQUEST;
+ }
+ 
+-static int
+-put_unicode_char(char *dest, uint16_t c)
+-{
+-	if (c < 0x80) {
+-		*dest = c;
+-		return 1;
+-	} else if (c < 0x800) {
+-		*(dest++) = 0xc0 | ((c >> 6) & 0x1f);
+-		*dest = 0x80 | (c & 0x3f);
+-		return 2;
+-	} else {
+-		*(dest++) = 0xe0 | ((c >> 12) & 0xf);
+-		*(dest++) = 0x80 | ((c >> 6) & 0x3f);
+-		*dest = 0x80 | (c & 0x3f);
+-		return 3;
+-	}
+-}
+-
+-
+-static int
+-pdu_decode_7bit_char(char *dest, int len, unsigned char c, bool *escape)
+-{
+-	uint16_t conv_0x20[] = {
+-		0x0040, 0x00A3, 0x0024, 0x00A5, 0x00E8, 0x00E9, 0x00F9, 0x00EC,
+-		0x00F2, 0x00E7, 0x000A, 0x00D8, 0x00F8, 0x000D, 0x00C5, 0x00E5,
+-		0x0394, 0x005F, 0x03A6, 0x0393, 0x039B, 0x03A9, 0x03A0, 0x03A8,
+-		0x03A3, 0x0398, 0x039E, 0x00A0, 0x00C6, 0x00E6, 0x00DF, 0x00C9,
+-	};
+-	uint16_t conv_0x5b[] = {
+-		0x00C4, 0x00D6, 0x00D1, 0x00DC, 0x00A7, 0x00BF,
+-	};
+-	uint16_t conv_0x7b[] = {
+-		0x00E4, 0x00F6, 0x00F1, 0x00FC, 0x00E0
+-	};
+-	int cur_len = 0;
+-	uint16_t outc;
+-
+-	fprintf(stderr, " %02x", c);
+-	dest += len;
+-	if (*escape) {
+-		*escape = false;
+-		switch(c) {
+-		case 0x0A:
+-			*dest = 0x0C;
+-			return 1;
+-		case 0x14:
+-			*dest = 0x5E;
+-			return 1;
+-		case 0x28:
+-			*dest = 0x7B;
+-			return 1;
+-		case 0x29:
+-			*dest = 0x7D;
+-			return 1;
+-		case 0x2F:
+-			*dest = 0x5C;
+-			return 1;
+-		case 0x3C:
+-			*dest = 0x5B;
+-			return 1;
+-		case 0x3D:
+-			*dest = 0x7E;
+-			return 1;
+-		case 0x3E:
+-			*dest = 0x5D;
+-			return 1;
+-		case 0x40:
+-			*dest = 0x7C;
+-			return 1;
+-		case 0x65:
+-			outc = 0x20AC;
+-			goto out;
+-		case 0x1B:
+-			goto normal;
+-		default:
+-			/* invalid */
+-			*(dest++) = conv_0x20[0x1B];
+-			cur_len++;
+-			goto normal;
+-		}
+-	}
+-
+-	if (c == 0x1b) {
+-		*escape = true;
+-		return 0;
+-	}
+-
+-normal:
+-	if (c < 0x20)
+-		outc = conv_0x20[(int) c];
+-	else if (c == 0x40)
+-		outc = 0x00A1;
+-	else if (c >= 0x5b && c <= 0x60)
+-		outc = conv_0x5b[c - 0x5b];
+-	else if (c >= 0x7b && c <= 0x7f)
+-		outc = conv_0x7b[c - 0x7b];
+-	else
+-		outc = c;
+-
+-out:
+-	return cur_len + put_unicode_char(dest, outc);
+-}
+-
+-static int
+-pdu_decode_7bit_str(char *dest, const unsigned char *data, int data_len, int bit_offset)
+-{
+-	bool escape = false;
+-	int len = 0;
+-	int i;
+-
+-	fprintf(stderr, "Raw text:");
+-	for (i = 0; i < data_len; i++) {
+-		int pos = (i + bit_offset) % 7;
+-
+-		if (pos == 0) {
+-			len += pdu_decode_7bit_char(dest, len, data[i] & 0x7f, &escape);
+-		} else {
+-			if (i)
+-				len += pdu_decode_7bit_char(dest, len,
+-				                            (data[i - 1] >> (7 + 1 - pos)) |
+-				                            ((data[i] << pos) & 0x7f), &escape);
+-
+-			if (pos == 6)
+-				len += pdu_decode_7bit_char(dest, len, (data[i] >> 1) & 0x7f,
+-				                            &escape);
+-		}
+-	}
+-	dest[len] = 0;
+-	fprintf(stderr, "\n");
+-	return len;
+-}
+-
+-static int decode_udh(const unsigned char *data)
+-{
+-	const unsigned char *end;
+-	unsigned int type, len, udh_len;
+-
+-	udh_len = *(data++);
+-	end = data + udh_len;
+-	while (data < end) {
+-		const unsigned char *val;
+-
+-		type = data[0];
+-		len = data[1];
+-		val = &data[2];
+-		data += 2 + len;
+-		if (data > end)
+-			break;
+-
+-		switch (type) {
+-		case 0x00:
+-			blobmsg_add_u32(&status, "concat_ref", (uint32_t) val[0]);
+-			blobmsg_add_u32(&status, "concat_part", (uint32_t) val[2]);
+-			blobmsg_add_u32(&status, "concat_parts", (uint32_t) val[1]);
+-			break;
+-		case 0x08:
+-			blobmsg_add_u32(&status, "concat_ref", (uint32_t) (val[0] << 8 | val[1]));
+-			blobmsg_add_u32(&status, "concat_part", (uint32_t) val[3]);
+-			blobmsg_add_u32(&status, "concat_parts", (uint32_t) val[2]);
+-			break;
+-		default:
+-			break;
+-		}
+-	}
+-
+-	return udh_len + 1;
+-}
+-
+-static void decode_7bit_field(char *name, const unsigned char *data, int data_len, int bit_offset)
+-{
+-	char *dest = blobmsg_alloc_string_buffer(&status, name, 3 * data_len + 2);
+-	int out_len = pdu_decode_7bit_str(dest, data, CEILDIV(data_len * 7, 8), bit_offset);
+-	dest[out_len] = 0;
+-	blobmsg_add_string_buffer(&status);
+-}
+-
+-static char *pdu_add_semioctet(char *str, char val)
+-{
+-	*str = '0' + (val & 0xf);
+-	if (*str <= '9')
+-		str++;
+-
+-	*str = '0' + ((val >> 4) & 0xf);
+-	if (*str <= '9')
+-		str++;
+-
+-	return str;
+-}
+-
+-static void
+-pdu_decode_address(char *str, unsigned char *data, int len)
+-{
+-	unsigned char toa;
+-
+-	toa = *(data++);
+-	switch (toa & 0x70) {
+-	case 0x50:
+-		pdu_decode_7bit_str(str, data, len, 0);
+-		return;
+-	case 0x10:
+-		*(str++) = '+';
+-		/* fall through */
+-	default:
+-		while (len--) {
+-			str = pdu_add_semioctet(str, *data);
+-			data++;
+-		}
+-	}
+-
+-	*str = 0;
+-}
+-
+-static void wms_decode_address(char *name, unsigned char *data, int len)
+-{
+-	char *str = blobmsg_alloc_string_buffer(&status, name, len * 2 + 2);
+-	pdu_decode_address(str, data, len);
+-	blobmsg_add_string_buffer(&status);
+-}
+-
+-static void blobmsg_add_hex(struct blob_buf *buf, const char *name, unsigned const char *data, int len)
+-{
+-	char* str = blobmsg_alloc_string_buffer(buf, name, len * 2 + 1);
+-	for (int i = 0; i < len; i++) {
+-		str += sprintf(str, "%02x", data[i]);
+-	}
+-	blobmsg_add_string_buffer(buf);
+-}
+-
+ #define cmd_wms_delete_message_cb no_cb
+ static enum qmi_cmd_result
+ cmd_wms_delete_message_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+@@ -333,135 +107,15 @@ cmd_wms_delete_message_prepare(struct qmi_dev *qmi, struct qmi_request *req, str
+ static void cmd_wms_get_message_cb(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
+ {
+ 	struct qmi_wms_raw_read_response res;
+-	unsigned char *data, *end;
+-	char *str;
+-	int cur_len;
+-	bool sent;
+-	unsigned char first, dcs;
++	char err[128] = "";
+ 	void *c;
+ 
+ 	qmi_parse_wms_raw_read_response(msg, &res);
+ 	c = blobmsg_open_table(&status, NULL);
+-	data = (unsigned char *) res.data.raw_message_data.raw_data;
+-	end = data + res.data.raw_message_data.raw_data_n;
+-
+-	cur_len = *(data++);
+-	if (data + cur_len >= end)
+-		goto error;
+-
+-	if (cur_len) {
+-		wms_decode_address("smsc", data, cur_len - 1);
+-		data += cur_len;
+-	}
+-
+-	if (data + 3 >= end)
+-		goto error;
+-
+-	first = *(data++);
+-	sent = (first & 0x3) == 1;
+-	if (sent)
+-		data++;
+-
+-	cur_len = *(data++);
+-	if (data + cur_len >= end)
+-		goto error;
+-
+-	if (cur_len) {
+-		cur_len = (cur_len + 1) / 2;
+-		wms_decode_address(sent ? "receiver" : "sender", data, cur_len);
+-		data += cur_len + 1;
+-	}
+-
+-	if (data + 3 >= end)
+-		goto error;
+-
+-	/* Protocol ID */
+-	if (*(data++) != 0)
+-		goto error;
+-
+-	/* Data Encoding */
+-	dcs = *(data++);
+-
+-	if (dcs & 0x10)
+-		blobmsg_add_u32(&status, "class", (dcs & 3));
+-
+-	if (sent) {
+-		/* Message validity */
+-		data++;
+-	} else {
+-		if (data + 6 >= end)
+-			goto error;
+-
+-		str = blobmsg_alloc_string_buffer(&status, "timestamp", 32);
+-
+-		/* year */
+-		*(str++) = '2';
+-		*(str++) = '0';
+-		str = pdu_add_semioctet(str, data[0]);
+-		/* month */
+-		*(str++) = '-';
+-		str = pdu_add_semioctet(str, data[1]);
+-		/* day */
+-		*(str++) = '-';
+-		str = pdu_add_semioctet(str, data[2]);
+-
+-		/* hour */
+-		*(str++) = ' ';
+-		str = pdu_add_semioctet(str, data[3]);
+-		/* minute */
+-		*(str++) = ':';
+-		str = pdu_add_semioctet(str, data[4]);
+-		/* second */
+-		*(str++) = ':';
+-		str = pdu_add_semioctet(str, data[5]);
+-		*str = 0;
+-
+-		blobmsg_add_string_buffer(&status);
+-
+-		data += 7;
+-	}
+-
+-	int message_len = *(data++);
+-	int udh_len = 0;
+-	int bit_offset = 0;
+-
+-	/* User Data Header */
+-	if (first & 0x40) {
+-		udh_len = decode_udh(data);
+-		data += udh_len;
+-		bit_offset = udh_len % 7;
+-		}
+-
+-	if (data >= end)
+-		goto error;
+-
+-	switch(dcs & 0x0c) {
+-		case 0x00:
+-			/* 7 bit GSM alphabet */
+-			message_len = message_len - CEILDIV(udh_len * 8, 7);
+-			message_len = MIN(message_len, CEILDIV((end - data) * 8, 7));
+-			decode_7bit_field("text", data, message_len, bit_offset);
+-			break;
+-		case 0x04:
+-			/* 8 bit data */
+-			message_len = MIN(message_len - udh_len, end - data);
+-			blobmsg_add_hex(&status, "data", data, message_len);
+-			break;
+-		case 0x08:
+-			/* 16 bit UCS-2 string */
+-			message_len = MIN(message_len - udh_len, end - data);
+-			blobmsg_add_hex(&status, "ucs-2", data, message_len);
+-			break;
+-		default:
+-			goto error;
+-		}
+-
++	if (uqmi_sms_pdu_to_blob(&status, (const uint8_t *) res.data.raw_message_data.raw_data,
++				 res.data.raw_message_data.raw_data_n, err, sizeof(err)))
++		fprintf(stderr, "There was an error reading message: %s\n", err);
+ 	blobmsg_close_table(&status, c);
+-	return;
+-
+-error:
+-	blobmsg_close_table(&status, c);
+-	fprintf(stderr, "There was an error reading message.\n");
+ }
+ 
+ static enum qmi_cmd_result
+@@ -533,154 +187,99 @@ cmd_wms_send_message_flash_prepare(struct qmi_dev *qmi, struct qmi_request *req,
+ 	return QMI_CMD_DONE;
+ }
+ 
+-static int
+-pdu_encode_semioctet(unsigned char *dest, const char *str)
+-{
+-	int len = 0;
+-	bool lower = true;
+-
+-	while (*str) {
+-		char digit = *str - '0';
+-
+-		if (lower)
+-			dest[len] = 0xf0 | digit;
+-		else
+-			dest[len++] &= (digit << 4) | 0xf;
+-
+-		lower = !lower;
+-		str++;
+-	}
+-
+-	return lower ? len : (len + 1);
+-}
+-
+-static int
+-pdu_encode_7bit_str(unsigned char *data, const char *str)
+-{
+-	unsigned char c;
+-	int len = 0;
+-	int ofs = 0;
+-
+-	while(1) {
+-		c = *(str++) & 0x7f;
+-		if (!c)
+-			break;
+-
+-		switch(ofs) {
+-		case 0:
+-			data[len] = c;
+-			break;
+-		default:
+-			data[len++] |= c << (8 - ofs);
+-			data[len] = c >> ofs;
+-			break;
+-		}
+-
+-		ofs = (ofs + 1) % 8;
+-	}
+-
+-	return len + 1;
+-}
+-
+-static int
+-pdu_encode_number(unsigned char *dest, const char *str, bool smsc)
+-{
+-	unsigned char format;
+-	bool ascii = false;
+-	int len = 0;
+-	int i;
+-
+-	dest[len++] = 0;
+-	if (*str == '+') {
+-		str++;
+-		format = 0x91;
+-	} else {
+-		format = 0x81;
+-	}
+-
+-	for (i = 0; str[i]; i++) {
+-		if (str[i] >= '0' && str[i] <= '9')
+-			continue;
+-
+-		ascii = true;
+-		break;
+-	}
+-
+-	if (ascii)
+-		format |= 0x40;
+-
+-	dest[len++] = format;
+-	if (!ascii)
+-		len += pdu_encode_semioctet(&dest[len], str);
+-	else
+-		len += pdu_encode_7bit_str(&dest[len], str);
+-
+-	if (smsc)
+-		dest[0] = len - 1;
+-	else
+-		dest[0] = strlen(str);
+-
+-	return len;
+-}
+-
+-static int
+-pdu_encode_data(unsigned char *dest, const char *str)
+-{
+-	int len = 0;
+-
+-	dest[len++] = 0;
+-	len += pdu_encode_7bit_str(&dest[len], str);
+-	dest[0] = strlen(str);
+-
+-	return len;
+-}
+-
+ #define cmd_wms_send_message_cb no_cb
+ static enum qmi_cmd_result
+ cmd_wms_send_message_prepare(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg, char *arg)
+ {
+-	static unsigned char buf[512];
++	static unsigned char buf[SMS_PDU_MAX];
+ 	static struct qmi_wms_raw_send_request mreq = {
+ 		QMI_INIT_SEQUENCE(raw_message_data,
+ 			.format = QMI_WMS_MESSAGE_FORMAT_GSM_WCDMA_POINT_TO_POINT,
+ 			.raw_data = buf,
+ 		),
+ 	};
+-	unsigned char *cur = buf;
+-	unsigned char first_octet = 0x11;
+-	unsigned char protocol_id = 0x00;
+-	unsigned char dcs = 0x00;
++	struct sms_chunk *chunks = NULL;
++	size_t n_chunks = 0, i;
++	bool gsm7;
++	uint8_t concat_ref = (uint8_t) (getpid() ^ time(NULL));
+ 
+ 	if (!_send.target || !*_send.target) {
+ 		uqmi_add_error("Missing argument");
+ 		return QMI_CMD_EXIT;
+ 	}
+ 
+-	if ((_send.smsc && strlen(_send.smsc) > 16) || strlen(_send.target) > 16 || strlen(arg) > 160) {
++	if ((_send.smsc && strlen(_send.smsc) > 16) || strlen(_send.target) > 16) {
+ 		uqmi_add_error("Argument too long");
+ 		return QMI_CMD_EXIT;
+ 	}
+ 
+-	if (_send.flash)
+-		dcs |= 0x10;
++	if (sms_split_text(arg, &gsm7, &chunks, &n_chunks) || !n_chunks || n_chunks > 255) {
++		free(chunks);
++		uqmi_add_error("Invalid message text");
++		return QMI_CMD_EXIT;
++	}
+ 
+-	if (!_send.smsc || !*_send.smsc)
+-		*(cur++) = 0;
+-	else
+-		cur += pdu_encode_number(cur, _send.smsc, true);
++	for (i = 0; i < n_chunks; i++) {
++		struct sms_part *part = sms_part_new(SMS_PART_INVALID_INDEX, SMS_PDU_SUBMIT);
++		char err[128] = "";
++		size_t pdulen = 0;
++		char *text;
++		int ret;
+ 
+-	*(cur++) = first_octet;
+-	*(cur++) = 0; /* reference */
++		if (!part)
++			goto fail;
+ 
+-	cur += pdu_encode_number(cur, _send.target, false);
+-	*(cur++) = protocol_id;
+-	*(cur++) = dcs;
++		text = strndup(arg + chunks[i].off, chunks[i].len);
++		if (!text) {
++			sms_part_free(part);
++			goto fail;
++		}
+ 
+-	*(cur++) = 0xff; /* validity */
+-	cur += pdu_encode_data(cur, arg);
++		sms_part_take_text(part, text);
++		part->encoding = gsm7 ? SMS_ENC_GSM7 : SMS_ENC_UCS2;
++		sms_part_set_number(part, _send.target);
++		if (_send.smsc && *_send.smsc)
++			sms_part_set_smsc(part, _send.smsc);
++		/* relative validity 0xff: 63 weeks */
++		part->validity_relative = 63 * 7 * 24 * 60;
++		if (_send.flash)
++			part->class = 0;
++		if (n_chunks > 1) {
++			part->should_concat = true;
++			part->concat_reference = concat_ref;
++			part->concat_max = n_chunks;
++			part->concat_sequence = i + 1;
++		}
+ 
+-	mreq.data.raw_message_data.raw_data_n = cur - buf;
+-	qmi_set_wms_raw_send_request(msg, &mreq);
++		ret = sms_part_3gpp_get_submit_pdu(part, buf, &pdulen, err, sizeof(err));
++		sms_part_free(part);
++		if (ret) {
++			free(chunks);
++			uqmi_add_error(err);
++			return QMI_CMD_EXIT;
++		}
++
++		mreq.data.raw_message_data.raw_data_n = pdulen;
++		qmi_set_wms_raw_send_request(msg, &mreq);
++
++		/* the last part is sent by the caller */
++		if (i + 1 == n_chunks)
++			break;
+ 
++		qmi_request_start(qmi, req, no_cb);
++		req->no_error_cb = true;
++		if (qmi_request_wait(qmi, req)) {
++			free(chunks);
++			uqmi_add_error(qmi_get_error_str(req->ret));
++			return QMI_CMD_EXIT;
++		}
++	}
++
++	free(chunks);
+ 	return QMI_CMD_REQUEST;
++
++fail:
++	free(chunks);
++	uqmi_add_error("Out of memory");
++	return QMI_CMD_EXIT;
+ }
+--- a/uqmi/commands.c
++++ b/uqmi/commands.c
+@@ -31,6 +31,7 @@
+ #include "uqmi.h"
+ #include "utils.h"
+ #include "commands.h"
++#include "ext-fmt.h"
+ 
+ struct blob_buf status;
+ bool single_line = false;
+@@ -43,18 +44,11 @@ static void cmd_version_cb(struct qmi_dev *qmi, struct qmi_request *req, struct
+ {
+ 	struct qmi_ctl_get_version_info_response res;
+ 	void *c;
+-	char name_buf[16];
+-	int i;
+ 
+ 	qmi_parse_ctl_get_version_info_response(msg, &res);
+ 
+ 	c = blobmsg_open_table(&status, NULL);
+-	for (i = 0; i < res.data.service_list_n; i++) {
+-		sprintf(name_buf, "service_%d", res.data.service_list[i].service);
+-		blobmsg_printf(&status, name_buf, "%d,%d",
+-			res.data.service_list[i].major_version,
+-			res.data.service_list[i].minor_version);
+-	}
++	ext_fmt_version_info(&status, &res);
+ 	blobmsg_close_table(&status, c);
+ }
+ 
+@@ -161,8 +155,10 @@ cmd_ctl_set_data_format_prepare(struct qmi_dev *qmi, struct qmi_request *req, st
+ 		return QMI_CMD_EXIT;
+ 	}
+ 
++	qmi_set(&sreq, format, QMI_CTL_DATA_FORMAT_QOS_FLOW_HEADER_ABSENT);
++	qmi_set(&sreq, protocol, mode);
+ 	qmi_set_ctl_set_data_format_request(msg, &sreq);
+-	return QMI_CMD_DONE;
++	return QMI_CMD_REQUEST;
+ }
+ 
+ #include "commands-wds.c"
+@@ -171,6 +167,8 @@ cmd_ctl_set_data_format_prepare(struct qmi_dev *qmi, struct qmi_request *req, st
+ #include "commands-wms.c"
+ #include "commands-wda.c"
+ #include "commands-uim.c"
++#include "commands-pdc.c"
++#include "commands-voice.c"
+ 
+ #define __uqmi_command(_name, _optname, _arg, _type) \
+ 	[__UQMI_COMMAND_##_name] = { \
+@@ -239,9 +237,18 @@ static bool __uqmi_run_commands(struct qmi_dev *qmi, bool option)
+ 			qmi_request_start(qmi, &req, cmds[i].handler->cb);
+ 			req.no_error_cb = true;
+ 			if (qmi_request_wait(qmi, &req)) {
+-				uqmi_add_error(qmi_get_error_str(req.ret));
++				/* the indication listener already reported its failure */
++				if (!(qmi->ind.active && qmi->ind.done))
++					uqmi_add_error(qmi_get_error_str(req.ret));
+ 				do_break = true;
+ 			}
++
++			if (qmi->ind.active) {
++				if (do_break)
++					qmi_indication_cancel(qmi);
++				else if (qmi_indication_wait(qmi))
++					do_break = true;
++			}
+ 		} else if (res == QMI_CMD_EXIT) {
+ 			do_break = true;
+ 		}
+--- a/uqmi/commands.h
++++ b/uqmi/commands.h
+@@ -31,6 +31,8 @@
+ #include "commands-wms.h"
+ #include "commands-wda.h"
+ #include "commands-uim.h"
++#include "commands-pdc.h"
++#include "commands-voice.h"
+ 
+ enum qmi_cmd_result {
+ 	QMI_CMD_DONE,
+@@ -66,7 +68,9 @@ struct uqmi_cmd {
+ 	__uqmi_nas_commands, \
+ 	__uqmi_wms_commands, \
+ 	__uqmi_wda_commands, \
+-	__uqmi_uim_commands
++	__uqmi_uim_commands, \
++	__uqmi_pdc_commands, \
++	__uqmi_voice_commands
+ 
+ #define __uqmi_command(_name, _optname, _arg, _option) __UQMI_COMMAND_##_name
+ enum uqmi_command {
+--- a/uqmi/dev.c
++++ b/uqmi/dev.c
+@@ -24,11 +24,13 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <stdarg.h>
+ #include <strings.h>
++#include <time.h>
+ #include "uqmi.h"
+ #include "qmi-errors.h"
+-#include "qmi-errors.c"
+ #include "mbim.h"
++#include "qmi-frame.h"
+ 
+ bool cancel_all_requests = false;
+ 
+@@ -51,44 +53,59 @@ void dump_packet(const char *prefix, void *ptr, int len)
+ }
+ #endif
+ 
+-static int
+-qmi_get_service_idx(QmiService svc)
++/* Set UQMI_DEBUG=1 to hex-dump every QMI message sent/received to stderr */
++static bool qmi_debug_enabled(void)
+ {
+-	int i;
++	static int enabled = -1;
+ 
+-	for (i = 0; i < ARRAY_SIZE(qmi_services); i++)
+-		if (qmi_services[i] == svc)
+-			return i;
++	if (enabled < 0) {
++		const char *env = getenv("UQMI_DEBUG");
+ 
+-	return -1;
++		enabled = env && *env && strcmp(env, "0");
++	}
++
++	return enabled;
+ }
+ 
+-static bool qmi_message_is_response(struct qmi_msg *msg)
++static void qmi_debug(const char *fmt, ...)
+ {
+-	if (msg->qmux.service == QMI_SERVICE_CTL) {
+-		if (msg->flags & QMI_CTL_FLAG_RESPONSE)
+-			return true;
+-	}
+-	else {
+-		if (msg->flags & QMI_SERVICE_FLAG_RESPONSE)
+-			return true;
+-	}
++	struct timespec ts;
++	va_list ap;
++
++	if (!qmi_debug_enabled())
++		return;
+ 
+-	return false;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	fprintf(stderr, "[%ld.%03ld] ", (long) ts.tv_sec, ts.tv_nsec / 1000000);
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fputc('\n', stderr);
+ }
+ 
+-static bool qmi_message_is_indication(struct qmi_msg *msg)
++static void qmi_debug_line(void *priv, const char *line)
+ {
+-	if (msg->qmux.service == QMI_SERVICE_CTL) {
+-		if (msg->flags & QMI_CTL_FLAG_INDICATION)
+-			return true;
+-	}
+-	else {
+-		if (msg->flags & QMI_SERVICE_FLAG_INDICATION)
+-			return true;
+-	}
++	qmi_debug("%s", line);
++}
+ 
+-	return false;
++void qmi_debug_msg(const char *dir, struct qmi_msg *msg)
++{
++	if (!qmi_debug_enabled())
++		return;
++
++	qmi_frame_dump(qmi_debug_line, NULL, dir, msg, le16_to_cpu(msg->qmux.len) + 1);
++}
++
++static int
++qmi_get_service_idx(QmiService svc)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(qmi_services); i++)
++		if (qmi_services[i] == svc)
++			return i;
++
++	return -1;
+ }
+ 
+ static void __qmi_request_complete(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg)
+@@ -120,42 +137,181 @@ static void __qmi_request_complete(struct qmi_dev *qmi, struct qmi_request *req,
+ 	}
+ }
+ 
+-static void qmi_process_msg(struct qmi_dev *qmi, struct qmi_msg *msg)
++static void qmi_indication_notify(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	if (!qmi->ind.active || qmi->ind.done)
++		return;
++
++	if (!msg)
++		qmi_debug("indication wait: timeout/cancelled");
++
++	qmi->ind.cb(qmi, msg);
++	if (qmi->ind.done)
++		return;
++
++	if (!msg)
++		qmi_indication_done(qmi, QMI_ERROR_CANCELLED);
++	else
++		uloop_timeout_set(&qmi->ind.timeout, qmi->ind.timeout_ms);
++}
++
++static void qmi_indication_queue_clear(struct qmi_dev *qmi)
++{
++	unsigned int i;
++
++	for (i = 0; i < qmi->ind_queue.n; i++)
++		free(qmi->ind_queue.msgs[i]);
++	qmi->ind_queue.n = 0;
++}
++
++void qmi_indication_buffer(struct qmi_dev *qmi, QmiService svc)
++{
++	qmi->ind_queue.enabled = true;
++	qmi->ind_queue.service = svc;
++}
++
++static void qmi_indication_enqueue(struct qmi_dev *qmi, struct qmi_msg *msg)
++{
++	unsigned int len = le16_to_cpu(msg->qmux.len) + 1;
++	struct qmi_msg *copy = malloc(len);
++
++	if (!copy)
++		return;
++
++	memcpy(copy, msg, len);
++	if (qmi->ind_queue.n == ARRAY_SIZE(qmi->ind_queue.msgs)) {
++		free(qmi->ind_queue.msgs[0]);
++		memmove(&qmi->ind_queue.msgs[0], &qmi->ind_queue.msgs[1],
++			sizeof(qmi->ind_queue.msgs[0]) * (qmi->ind_queue.n - 1));
++		qmi->ind_queue.n--;
++	}
++	qmi->ind_queue.msgs[qmi->ind_queue.n++] = copy;
++	qmi_debug("indication queued (%u pending)", qmi->ind_queue.n);
++}
++
++static void qmi_indication_replay(struct qmi_dev *qmi)
++{
++	unsigned int i;
++
++	for (i = 0; i < qmi->ind_queue.n; i++) {
++		if (qmi->ind.active && !qmi->ind.done &&
++		    qmi->ind_queue.msgs[i]->qmux.service == qmi->ind.service)
++			qmi_indication_notify(qmi, qmi->ind_queue.msgs[i]);
++	}
++	qmi_indication_queue_clear(qmi);
++}
++
++static void qmi_indication_timeout(struct uloop_timeout *t)
++{
++	struct qmi_dev *qmi = container_of(t, struct qmi_dev, ind.timeout);
++
++	qmi_indication_notify(qmi, NULL);
++}
++
++void qmi_indication_listen(struct qmi_dev *qmi, QmiService svc, indication_cb cb, int timeout_ms)
++{
++	qmi_debug("indication wait: listening for service 0x%02x (timeout %d ms)", svc, timeout_ms);
++	qmi->ind.active = true;
++	qmi->ind.done = false;
++	qmi->ind.ret = 0;
++	qmi->ind.service = svc;
++	qmi->ind.cb = cb;
++	qmi->ind.timeout_ms = timeout_ms;
++	qmi->ind.timeout.cb = qmi_indication_timeout;
++	uloop_timeout_set(&qmi->ind.timeout, timeout_ms);
++}
++
++void qmi_indication_done(struct qmi_dev *qmi, int ret)
++{
++	if (!qmi->ind.active || qmi->ind.done)
++		return;
++
++	qmi_debug("indication wait: done (ret=%d)", ret);
++	qmi->ind.done = true;
++	qmi->ind.ret = ret;
++	uloop_timeout_cancel(&qmi->ind.timeout);
++	uloop_cancelled = true;
++}
++
++void qmi_indication_cancel(struct qmi_dev *qmi)
++{
++	uloop_timeout_cancel(&qmi->ind.timeout);
++	qmi->ind.active = false;
++	qmi->ind.done = false;
++}
++
++/*! Run uloop until the registered indication listener has completed
++ *
++ * \param qmi the qmi device
++ * \return the value passed to qmi_indication_done() (0 on success)
++ */
++int qmi_indication_wait(struct qmi_dev *qmi)
++{
++	bool cancelled;
++	int ret;
++
++	qmi_indication_replay(qmi);
++
++	while (qmi->ind.active && !qmi->ind.done) {
++		if (cancel_all_requests) {
++			qmi_indication_notify(qmi, NULL);
++			break;
++		}
++
++		cancelled = uloop_cancelled;
++		uloop_cancelled = false;
++		uloop_run();
++		uloop_cancelled = cancelled;
++	}
++
++	ret = qmi->ind.ret;
++	qmi_indication_cancel(qmi);
++
++	return ret;
++}
++
++static void qmi_process_msg(struct qmi_dev *qmi, struct qmi_msg *msg, const struct qmi_frame_info *info)
+ {
+ 	struct qmi_request *req;
+-	uint16_t tid;
+ 
+-	if (qmi_message_is_indication(msg)) {
+-		if (msg->qmux.service == QMI_SERVICE_CTL) {
+-			struct qmi_msg sync_msg = {0};
+-			qmi_set_ctl_sync_request(&sync_msg);
++	qmi_debug_msg("RX", msg);
++
++	if (info->indication) {
++		if (info->ctl) {
+ 			/* A SYNC indication might be sent on boot in order to indicate
+ 			 * that all Client IDs have been deallocated by the modem:
+ 			 * cancel all requests, as they will not be answered. */
+-			if (msg->ctl.message == sync_msg.ctl.message) {
++			if (qmi_frame_is_ctl_sync(info)) {
+ 				while (!list_empty(&qmi->req)) {
+ 					req = list_first_entry(&qmi->req, struct qmi_request, list);
+ 					qmi_request_cancel(qmi, req);
+ 				}
+ 			}
++		} else {
++			int idx = qmi_get_service_idx(info->service);
++
++			if (idx < 0 || !(qmi->service_connected & (1 << idx)) ||
++			    !qmi_frame_ind_for_client(info->client, qmi->service_data[idx].client_id)) {
++				/* the modem broadcasts to every client of the service */
++				qmi_debug("indication for other client ignored (cid=%u)", info->client);
++			} else if (qmi->ind.active && info->service == qmi->ind.service) {
++				qmi_indication_notify(qmi, msg);
++			} else if (qmi->ind_queue.enabled && info->service == qmi->ind_queue.service) {
++				qmi_indication_enqueue(qmi, msg);
++			}
+ 		}
+ 
+ 		return;
+ 	}
+ 
+-	if (!qmi_message_is_response(msg))
++	if (!info->response)
+ 		return;
+ 
+-	if (msg->qmux.service == QMI_SERVICE_CTL)
+-		tid = msg->ctl.transaction;
+-	else
+-		tid = le16_to_cpu(msg->svc.transaction);
+-
+ 	list_for_each_entry(req, &qmi->req, list) {
+-		if (req->service != msg->qmux.service)
++		if (req->service != info->service)
+ 			continue;
+ 
+-		if (req->tid != tid)
++		if (req->tid != info->tid)
+ 			continue;
+ 
+ 		__qmi_request_complete(qmi, req, msg);
+@@ -166,10 +322,11 @@ static void qmi_process_msg(struct qmi_dev *qmi, struct qmi_msg *msg)
+ static void qmi_notify_read(struct ustream *us, int bytes)
+ {
+ 	struct qmi_dev *qmi = container_of(us, struct qmi_dev, sf.stream);
+-	struct qmi_msg *msg;
++	struct qmi_frame_info info;
++	const void *frame;
++	size_t frame_len, consume;
+ 	char *buf;
+-	int len, msg_len;
+-
++	int len, ret;
+ 
+ 	while (1) {
+ 		buf = ustream_get_read_buf(us, &len);
+@@ -178,29 +335,43 @@ static void qmi_notify_read(struct ustream *us, int bytes)
+ 
+ 		dump_packet("Received packet", buf, len);
+ 		if (qmi->is_mbim) {
+-			struct mbim_command_message *mbim = (void *) buf;
+-
+-			if (len < sizeof(*mbim))
++			ret = qmi_mbim_deframe(buf, len, &consume, &frame, &frame_len);
++			if (ret == QMI_FRAME_NEED_MORE)
+ 				return;
+-			msg = (struct qmi_msg *) (buf + sizeof(*mbim));
+-			msg_len = le32_to_cpu(mbim->header.length);
+-			if (!is_mbim_qmi(mbim)) {
+-				/* must consume other MBIM packets */
+-				ustream_consume(us, msg_len);
++
++			if (ret == QMI_FRAME_INVALID) {
++				ustream_consume(us, len);
+ 				return;
+ 			}
++
++			/* must consume other MBIM packets */
++			if (ret == QMI_MBIM_SKIP) {
++				ustream_consume(us, consume);
++				continue;
++			}
++
++			ret = qmi_frame_parse(frame, frame_len, &info);
++			if (ret <= 0) {
++				ustream_consume(us, consume);
++				continue;
++			}
+ 		} else {
+-			if (len < offsetof(struct qmi_msg, flags))
++			frame = buf;
++			ret = qmi_frame_parse(frame, len, &info);
++			if (ret == QMI_FRAME_NEED_MORE)
+ 				return;
+-			msg = (struct qmi_msg *) buf;
+-			msg_len = le16_to_cpu(msg->qmux.len) + 1;
+-		}
+ 
+-		if (len < msg_len)
+-			return;
++			if (ret < 0) {
++				/* garbage, no way to resynchronize */
++				ustream_consume(us, len);
++				return;
++			}
++
++			consume = ret;
++		}
+ 
+-		qmi_process_msg(qmi, msg);
+-		ustream_consume(us, msg_len);
++		qmi_process_msg(qmi, (struct qmi_msg *) frame, &info);
++		ustream_consume(us, consume);
+ 	}
+ }
+ 
+@@ -228,6 +399,8 @@ int qmi_request_start(struct qmi_dev *qmi, struct qmi_request *req, request_cb c
+ 		msg->qmux.client = qmi->service_data[idx].client_id;
+ 	}
+ 
++	qmi_debug_msg("TX", msg);
++
+ 	req->tid = tid;
+ 	req->cb = cb;
+ 	req->pending = true;
+@@ -269,13 +442,15 @@ int qmi_request_wait(struct qmi_dev *qmi, struct qmi_request *req)
+ 
+ 	req->complete = &complete;
+ 	while (!complete) {
++		/* cancelled by timeout/signal, or the indication listener gave up */
++		if (cancel_all_requests || (qmi->ind.active && qmi->ind.done)) {
++			qmi_request_cancel(qmi, req);
++			break;
++		}
++
+ 		cancelled = uloop_cancelled;
+ 		uloop_cancelled = false;
+ 		uloop_run();
+-
+-		if (cancel_all_requests)
+-			qmi_request_cancel(qmi, req);
+-
+ 		uloop_cancelled = cancelled;
+ 	}
+ 
+@@ -338,6 +513,19 @@ int qmi_service_connect(struct qmi_dev *qmi, QmiService svc, int client_id)
+ 	return 0;
+ }
+ 
++struct qmi_release_wait {
++	struct uloop_timeout timeout;
++	struct qmi_dev *qmi;
++	struct qmi_request *req;
++};
++
++static void qmi_release_timeout(struct uloop_timeout *t)
++{
++	struct qmi_release_wait *rel = container_of(t, struct qmi_release_wait, timeout);
++
++	qmi_request_cancel(rel->qmi, rel->req);
++}
++
+ static void __qmi_service_disconnect(struct qmi_dev *qmi, int idx)
+ {
+ 	int client_id = qmi->service_data[idx].client_id;
+@@ -348,6 +536,7 @@ static void __qmi_service_disconnect(struct qmi_dev *qmi, int idx)
+ 		)
+ 	};
+ 	struct qmi_request req;
++	struct qmi_release_wait rel = {};
+ 	struct qmi_msg *msg = qmi->buf;
+ 
+ 	qmi->service_connected &= ~(1 << idx);
+@@ -356,7 +545,19 @@ static void __qmi_service_disconnect(struct qmi_dev *qmi, int idx)
+ 
+ 	qmi_set_ctl_release_cid_request(msg, &creq);
+ 	qmi_request_start(qmi, &req, NULL);
++
++	/*
++	 * Must work after -t expiry / SIGINT / SIGTERM, which set
++	 * cancel_all_requests: wait for the answer with a short timeout of
++	 * its own, otherwise the client id leaks in the modem.
++	 */
++	cancel_all_requests = false;
++	rel.qmi = qmi;
++	rel.req = &req;
++	rel.timeout.cb = qmi_release_timeout;
++	uloop_timeout_set(&rel.timeout, 2000);
+ 	qmi_request_wait(qmi, &req);
++	uloop_timeout_cancel(&rel.timeout);
+ }
+ 
+ int qmi_service_release_client_id(struct qmi_dev *qmi, QmiService svc)
+@@ -426,6 +627,7 @@ void qmi_device_close(struct qmi_dev *qmi)
+ 	struct qmi_request *req;
+ 
+ 	qmi_close_all_services(qmi);
++	qmi_indication_queue_clear(qmi);
+ 	ustream_free(&qmi->sf.stream);
+ 	close(qmi->sf.fd.fd);
+ 
+@@ -448,6 +650,8 @@ QmiService qmi_service_get_by_name(const char *str)
+ 		{ "wms", QMI_SERVICE_WMS },
+ 		{ "wda", QMI_SERVICE_WDA },
+ 		{ "uim", QMI_SERVICE_UIM },
++		{ "pdc", QMI_SERVICE_PDC },
++		{ "voice", QMI_SERVICE_VOICE },
+ 	};
+ 	int i;
+ 
+--- /dev/null
++++ b/uqmi/sms-json.c
+@@ -0,0 +1,87 @@
++/*
++ * uqmi -- JSON output of a decoded SMS PDU (shared codec: common/sms_part.c)
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "charsets.h"
++#include "sms_part.h"
++#include "sms-json.h"
++
++static void add_hex(struct blob_buf *b, const char *name, const uint8_t *data, size_t len)
++{
++	char *str = blobmsg_alloc_string_buffer(b, name, len * 2 + 1);
++	size_t i;
++
++	for (i = 0; i < len; i++)
++		str += sprintf(str, "%02x", data[i]);
++	blobmsg_add_string_buffer(b);
++}
++
++/* ISO8601 "YYYY-MM-DDTHH:MM:SS+HH:MM" to the historic "YYYY-MM-DD HH:MM:SS" */
++static void add_timestamp(struct blob_buf *b, const char *iso)
++{
++	char ts[32];
++
++	if (!iso || strlen(iso) < 19)
++		return;
++
++	memcpy(ts, iso, 19);
++	ts[10] = ' ';
++	ts[19] = 0;
++	blobmsg_add_string(b, "timestamp", ts);
++}
++
++int uqmi_sms_pdu_to_blob(struct blob_buf *b, const uint8_t *pdu, size_t len, char *err, size_t errlen)
++{
++	struct sms_part *part = NULL;
++	bool sent;
++
++	if (sms_part_3gpp_from_pdu(0, pdu, len, false, &part, err, errlen))
++		return -1;
++
++	sent = part->pdu_type == SMS_PDU_SUBMIT;
++
++	if (part->smsc && *part->smsc)
++		blobmsg_add_string(b, "smsc", part->smsc);
++	if (part->number)
++		blobmsg_add_string(b, sent || part->pdu_type == SMS_PDU_STATUS_REPORT ? "receiver" : "sender",
++				   part->number);
++	if (part->class >= 0)
++		blobmsg_add_u32(b, "class", part->class);
++	if (!sent)
++		add_timestamp(b, part->timestamp);
++	if (part->should_concat) {
++		blobmsg_add_u32(b, "concat_ref", part->concat_reference);
++		blobmsg_add_u32(b, "concat_part", part->concat_sequence);
++		blobmsg_add_u32(b, "concat_parts", part->concat_max);
++	}
++
++	switch (part->encoding) {
++	case SMS_ENC_GSM7:
++		blobmsg_add_string(b, "text", part->text ? part->text : "");
++		break;
++	case SMS_ENC_UCS2:
++		if (part->text) {
++			size_t n = 0;
++			uint8_t *u16 = cs_utf8_to_utf16be(part->text, &n);
++
++			if (u16) {
++				add_hex(b, "ucs-2", u16, n);
++				free(u16);
++			} else {
++				blobmsg_add_string(b, "ucs-2", "");
++			}
++			blobmsg_add_string(b, "text", part->text);
++		}
++		break;
++	default:
++		if (part->data)
++			add_hex(b, "data", part->data, part->data_len);
++		break;
++	}
++
++	sms_part_free(part);
++	return 0;
++}
+--- /dev/null
++++ b/uqmi/sms-json.h
+@@ -0,0 +1,14 @@
++#ifndef __UQMI_SMS_JSON_H
++#define __UQMI_SMS_JSON_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <libubox/blobmsg.h>
++
++/*
++ * Decode a raw WMS PDU (SMSC address in front) with the shared SMS codec and add the fields of the
++ * --get-message output to @b (which must have an open table). Returns 0, or -1 and a message in @err.
++ */
++int uqmi_sms_pdu_to_blob(struct blob_buf *b, const uint8_t *pdu, size_t len, char *err, size_t errlen);
++
++#endif
+--- a/uqmi/uqmi.c
++++ b/uqmi/uqmi.c
+@@ -60,7 +60,7 @@ static int usage(const char *progname)
+ 		"  --mbim, -m                        NAME is an MBIM device with EXT_QMUX support\n"
+ 		"  --timeout, -t                     response timeout in msecs\n"
+ 		"\n"
+-		"Services:                           dms, nas, pds, wds, wms\n"
++		"Services:                           dms, nas, pds, wds, wms, wda, uim, pdc, voice\n"
+ 		"\n"
+ 		"Actions:\n"
+ 		"  --get-versions:                   Get service versions\n"
+@@ -75,6 +75,8 @@ static int usage(const char *progname)
+ 		nas_helptext
+ 		wms_helptext
+ 		wda_helptext
++		pdc_helptext
++		voice_helptext
+ 		"\n", progname);
+ 	return 1;
+ }
+@@ -166,6 +168,11 @@ int main(int argc, char **argv)
+ 
+ 	ret = uqmi_run_commands(&dev) ? 0 : -1;
+ 
++	/* releasing the client ids must not be aborted by a late -t/signal */
++	uloop_timeout_cancel(&request_timeout);
++	signal(SIGINT, SIG_IGN);
++	signal(SIGTERM, SIG_IGN);
++
+ 	qmi_device_close(&dev);
+ 
+ 	return ret;
+--- a/uqmi/uqmi.h
++++ b/uqmi/uqmi.h
+@@ -29,6 +29,8 @@
+ 
+ #include "qmi-message.h"
+ 
++void qmi_debug_msg(const char *dir, struct qmi_msg *msg);
++
+ #ifdef DEBUG_PACKET
+ void dump_packet(const char *prefix, void *ptr, int len);
+ #else
+@@ -56,7 +58,8 @@ static inline void dump_packet(const char *prefix, void *ptr, int len)
+     __qmi_service(QMI_SERVICE_CAT), \
+     __qmi_service(QMI_SERVICE_RMS), \
+     __qmi_service(QMI_SERVICE_OMA), \
+-    __qmi_service(QMI_SERVICE_WDA)
++    __qmi_service(QMI_SERVICE_WDA), \
++    __qmi_service(QMI_SERVICE_PDC)
+ 
+ #define __qmi_service(_n) __##_n
+ enum {
+@@ -70,6 +73,7 @@ struct qmi_request;
+ struct qmi_msg;
+ 
+ typedef void (*request_cb)(struct qmi_dev *qmi, struct qmi_request *req, struct qmi_msg *msg);
++typedef void (*indication_cb)(struct qmi_dev *qmi, struct qmi_msg *msg);
+ 
+ struct qmi_dev {
+ 	struct ustream_fd sf;
+@@ -89,6 +93,25 @@ struct qmi_dev {
+ 	uint8_t ctl_tid;
+ 	void *buf;
+ 
++	/* Indication wait state, see qmi_indication_listen() */
++	struct {
++		bool active;
++		bool done;
++		int ret;
++		uint8_t service;
++		int timeout_ms;
++		indication_cb cb;
++		struct uloop_timeout timeout;
++	} ind;
++
++	/* Indications received before a listener was registered, see qmi_indication_buffer() */
++	struct {
++		bool enabled;
++		uint8_t service;
++		unsigned int n;
++		struct qmi_msg *msgs[16];
++	} ind_queue;
++
+ 	bool is_mbim;
+ };
+ 
+@@ -118,6 +141,27 @@ static inline bool qmi_request_pending(struct qmi_request *req)
+ 	return req->pending;
+ }
+ 
++/*
++ * Indications are only delivered while a listener is registered. The callback
++ * is invoked for each indication of the given service addressed to this
++ * client, and with msg == NULL if no indication arrived within timeout_ms
++ * (or the operation was cancelled). It must call qmi_indication_done() once
++ * the operation is complete. The listener is typically registered from a
++ * command's prepare function; the command runner then calls
++ * qmi_indication_wait() after the request has been answered.
++ */
++void qmi_indication_listen(struct qmi_dev *qmi, QmiService svc, indication_cb cb, int timeout_ms);
++void qmi_indication_done(struct qmi_dev *qmi, int ret);
++void qmi_indication_cancel(struct qmi_dev *qmi);
++int qmi_indication_wait(struct qmi_dev *qmi);
++
++/*
++ * Keep indications of the given service addressed to this client that arrive
++ * while no listener is registered (e.g. while a dial request is in flight),
++ * and hand them to the listener once qmi_indication_wait() is called.
++ */
++void qmi_indication_buffer(struct qmi_dev *qmi, QmiService svc);
++
+ int qmi_service_connect(struct qmi_dev *qmi, QmiService svc, int client_id);
+ int qmi_service_get_client_id(struct qmi_dev *qmi, QmiService svc);
+ int qmi_service_release_client_id(struct qmi_dev *qmi, QmiService svc);
