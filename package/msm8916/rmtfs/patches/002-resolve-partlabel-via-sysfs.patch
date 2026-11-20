@@ -1,0 +1,76 @@
+--- a/storage.c	2026-11-12 17:30:45.414977410 +0000
++++ b/storage.c	2026-11-12 17:30:45.415977413 +0000
+@@ -1,5 +1,6 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
++#include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdio.h>
+@@ -109,6 +110,48 @@
+ 	return 0;
+ }
+ 
++/*
++ * Without udev there is no /dev/disk/by-partlabel: find the block device
++ * whose PARTNAME matches in /sys/class/block/<dev>/uevent instead.
++ */
++static int resolve_partlabel(const char *label, char *out, size_t outlen)
++{
++	char path[300], line[128], devname[64];
++	struct dirent *de;
++	DIR *dir;
++	FILE *f;
++	int found = 0;
++
++	dir = opendir("/sys/class/block");
++	if (!dir)
++		return -1;
++
++	while (!found && (de = readdir(dir))) {
++		if (de->d_name[0] == '.')
++			continue;
++		snprintf(path, sizeof(path), "/sys/class/block/%s/uevent", de->d_name);
++		f = fopen(path, "r");
++		if (!f)
++			continue;
++		devname[0] = '\0';
++		while (fgets(line, sizeof(line), f)) {
++			line[strcspn(line, "\n")] = '\0';
++			if (!strncmp(line, "DEVNAME=", 8))
++				snprintf(devname, sizeof(devname), "%s", line + 8);
++			else if (!strncmp(line, "PARTNAME=", 9) && !strcmp(line + 9, label))
++				found = 1;
++		}
++		fclose(f);
++		if (found && devname[0])
++			snprintf(out, outlen, "/dev/%s", devname);
++		else
++			found = 0;
++	}
++	closedir(dir);
++
++	return found ? 0 : -1;
++}
++
+ struct rmtfd *storage_open(unsigned node, const char *path, const char *slot_suffix)
+ {
+ 	char *fspath;
+@@ -155,7 +198,16 @@
+ 	pathlen = strlen(storage_dir) + strlen(file) + 2 + strnlen(slot_suffix, SLOT_SUFFIX_LEN);
+ 	fspath = alloca(pathlen);
+ 	snprintf(fspath, pathlen, "%s/%s", storage_dir, file);
+-	ret = fd_open(rmtfd, fspath, part);
++	/* No udev (e.g. OpenWrt): look the partition up in sysfs directly */
++	if (storage_use_partitions && access(storage_dir, F_OK)) {
++		char devpath[80];
++
++		ret = resolve_partlabel(file, devpath, sizeof(devpath));
++		if (!ret)
++			ret = fd_open(rmtfd, devpath, part);
++	} else {
++		ret = fd_open(rmtfd, fspath, part);
++	}
+ 	if (ret) {
+ 		/* Try again with the slot suffix before giving up */
+ 		if (!slot_suffix)

@@ -1,0 +1,11 @@
+--- a/sharedmem.c
++++ b/sharedmem.c
+@@ -8,7 +8,7 @@
+ #ifndef ANDROID
+ #include <libudev.h>
+ #else
+-#include <sys/endian.h>
++#include <endian.h>
+ #endif
+ #include <stdbool.h>
+ #include <stdio.h>
