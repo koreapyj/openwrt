@@ -1,0 +1,143 @@
+#!/bin/sh
+# Common code of the uqmid init, hotplug and monitor scripts.
+# Mirrors /usr/share/ModemManager/modemmanager.common of OpenWrt's modemmanager package.
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+################################################################################
+# Runtime state
+
+UQMID_RUNDIR="/var/run/uqmid"
+UQMID_PID_FILE="${UQMID_RUNDIR}/uqmid.pid"
+UQMID_MONITOR_CACHE="${UQMID_RUNDIR}/monitor.cache"
+UQMID_EVENTS_CACHE="${UQMID_RUNDIR}/events.cache"
+
+################################################################################
+# Common logging
+
+uqmid_log() {
+	local level="$1"; shift
+
+	[ "${level}" = "debug" ] && return
+	logger -p "daemon.${level}" -t "uqmid[$$]" "$*"
+}
+
+################################################################################
+# Event reporting
+
+# Receives as input the action, the device name, the subsystem and the sysfs path
+uqmid_report_event() {
+	local action="$1"
+	local name="$2"
+	local subsystem="$3"
+	local sysfspath="$4"
+
+	local result
+
+	# Track/untrack events in cache
+	case "${action}" in
+		"add")
+			# On add events, store event details in cache (if not exists yet)
+			grep -qs "^add,${name},${subsystem}," "${UQMID_EVENTS_CACHE}" || \
+				echo "${action},${name},${subsystem},${sysfspath}" >> "${UQMID_EVENTS_CACHE}"
+			;;
+		"remove")
+			# On remove events, remove old events from cache (match by subsystem+name)
+			sed -i "/^add,${name},${subsystem},/d" "${UQMID_EVENTS_CACHE}" 2>/dev/null
+			;;
+	esac
+
+	# Skip live report if uqmid isn't up; the wrapper replays the cache when it starts.
+	if [ ! -s "${UQMID_PID_FILE}" ] || \
+		! kill -0 "$(cat "${UQMID_PID_FILE}" 2>/dev/null)" 2>/dev/null; then
+		return 0
+	fi
+
+	uqmid_log "debug" "Report event: action=${action}, name=${name}, subsystem=${subsystem}"
+	json_init
+	json_add_string action "${action}"
+	json_add_string subsystem "${subsystem}"
+	json_add_string name "${name}"
+	json_add_string sysfs "${sysfspath}"
+	result=$(ubus -t 5 call uqmid report_kernel_event "$(json_dump)" 2>&1)
+	if [ "$?" -ne "0" ]; then
+		uqmid_log "error" "Couldn't report kernel event: ${result}"
+	fi
+
+	return 0
+}
+
+uqmid_report_event_from_cache_line() {
+	local event_line="$1"
+
+	local action name subsystem sysfspath
+	action=$(echo "${event_line}" | awk -F ',' '{ print $1 }')
+	name=$(echo "${event_line}" | awk -F ',' '{ print $2 }')
+	subsystem=$(echo "${event_line}" | awk -F ',' '{ print $3 }')
+	sysfspath=$(echo "${event_line}" | awk -F ',' '{ print $4 }')
+
+	uqmid_log "debug" "cached event found: action=${action}, name=${name}, subsystem=${subsystem}, sysfspath=${sysfspath}"
+	uqmid_report_event "${action}" "${name}" "${subsystem}" "${sysfspath}"
+}
+
+# Wait for the daemon to be available on ubus. Returns 0 if it is.
+uqmid_wait_for_daemon() {
+	local n=60
+	local step=1
+
+	while [ $n -ge 0 ]; do
+		sleep $step
+		uqmid_log "info" "checking if uqmid is available..."
+
+		if ubus -t 1 list uqmid >/dev/null 2>&1; then
+			return 0
+		fi
+		uqmid_log "info" "uqmid not yet available"
+		n=$((n-step))
+	done
+
+	return 1
+}
+
+uqmid_report_events_from_cache() {
+	uqmid_wait_for_daemon || {
+		uqmid_log "error" "couldn't report initial kernel events: uqmid not running"
+		return
+	}
+
+	[ -f "${UQMID_EVENTS_CACHE}" ] || return
+
+	# Report cached kernel events
+	while IFS= read -r event_line; do
+		uqmid_report_event_from_cache_line "${event_line}"
+	done < "${UQMID_EVENTS_CACHE}"
+}
+
+################################################################################
+# Network interface configuration of a modem
+
+# Callback for config_foreach(): $2 is the device node, $3 the port name and
+# $4 the physdev of the modem. The interface option 'device' may be any of them.
+uqmid_get_modem_config_foreach_cb() {
+	local cfg="$1"
+	local devnode="$2"
+	local port="$3"
+	local physdev="$4"
+
+	local proto dev
+	proto=$(uci_get network "${cfg}" proto)
+	[ "${proto}" = "uqmid" ] || return 0
+
+	dev=$(uci_get network "${cfg}" device)
+	[ -n "${dev}" ] || return 0
+	[ "${dev}" = "${devnode}" ] || [ "${dev}" = "${port}" ] || [ "${dev}" = "${physdev}" ] || return 0
+
+	echo "${cfg}"
+}
+
+# Returns the name of the interface configured for this modem
+uqmid_get_modem_config() {
+	config_load network
+	config_foreach uqmid_get_modem_config_foreach_cb interface "$1" "$2" "$3"
+}

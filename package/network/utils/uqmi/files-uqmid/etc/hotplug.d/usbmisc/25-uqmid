@@ -1,0 +1,21 @@
+#!/bin/sh
+# Report the QMI control ports (cdc-wdm) of the usbmisc subsystem to uqmid.
+
+# Load hotplug common utilities
+. /usr/share/uqmid/uqmid.common
+
+# We require a device name
+[ -n "$DEVNAME" ] || exit
+
+case "$DEVNAME" in
+	cdc-wdm*) ;;
+	*) exit ;;
+esac
+
+[ "$ACTION" = add ] || [ "$ACTION" = remove ] || exit
+
+# Always make sure the rundir exists
+mkdir -m 0755 -p "${UQMID_RUNDIR}"
+
+uqmid_report_event "${ACTION}" "${DEVNAME}" "usbmisc" "/sys${DEVPATH}" || exit
+uqmid_log "info" "${ACTION} usbmisc control port ${DEVNAME}: event processed"

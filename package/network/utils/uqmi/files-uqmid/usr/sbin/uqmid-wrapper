@@ -1,0 +1,36 @@
+#!/bin/sh
+# Starts uqmid and reports the cached kernel events to it, like ModemManager-wrapper.
+
+. /usr/share/uqmid/uqmid.common
+
+trap_with_arg() {
+	func="$1" ; shift
+	for sig ; do
+		# shellcheck disable=SC2064
+		trap "$func $sig" "$sig"
+	done
+}
+
+func_trap() {
+	logger "uqmid-wrapper[$$]" "Sending signal ${1}..."
+	kill "-${1}" "$CHILD" 2>/dev/null
+}
+
+main() {
+	trap_with_arg func_trap INT TERM KILL
+
+	mkdir -p "${UQMID_RUNDIR}"
+	chmod 0755 "${UQMID_RUNDIR}"
+
+	/sbin/uqmid "$@" &
+	CHILD="$!"
+	# the pid of the wrapper is the one procd tracks; remember the daemon for the hotplug scripts
+	echo "${CHILD}" > "${UQMID_PID_FILE}"
+
+	uqmid_report_events_from_cache
+
+	wait "$CHILD"
+	rm -f "${UQMID_PID_FILE}"
+}
+
+main "$@"

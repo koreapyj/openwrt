@@ -1,0 +1,24 @@
+#!/bin/sh
+# Report the QMI control ports of the wwan subsystem to uqmid.
+# Based on 25-modemmanager-wwan.
+
+# Load hotplug common utilities
+. /usr/share/uqmid/uqmid.common
+
+# We require a device name
+[ -n "$DEVNAME" ] || exit
+
+# uqmid only handles QMI control ports (not wwan0at0, wwan0mbim0, ...)
+case "$DEVNAME" in
+	wwan*qmi*) ;;
+	*) exit ;;
+esac
+
+[ "$ACTION" = add ] || [ "$ACTION" = remove ] || exit
+
+# Always make sure the rundir exists
+mkdir -m 0755 -p "${UQMID_RUNDIR}"
+
+# Report wwan
+uqmid_report_event "${ACTION}" "${DEVNAME}" "wwan" "/sys${DEVPATH}" || exit
+uqmid_log "info" "${ACTION} wwan control port ${DEVNAME}: event processed"

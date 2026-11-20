@@ -1,0 +1,168 @@
+#!/bin/sh
+# Marks the netifd interfaces of the modems (proto uqmid) as available or
+# unavailable when the modems are added to or removed from uqmid, like
+# ModemManager-monitor.
+
+. /lib/functions.sh
+. /lib/netifd/netifd-proto.sh
+. /usr/share/uqmid/uqmid.common
+
+trap_with_arg() {
+	func="$1" ; shift
+	pid="$1" ; shift
+	for sig ; do
+		# shellcheck disable=SC2064
+		trap "$func $sig $pid" "$sig"
+	done
+}
+
+func_trap() {
+	local monitor_cache_line object
+
+	logger "uqmid-monitor[$$]" "Sending signal ${1} ..."
+
+	# Set all configured logical interfaces to unavailable
+	[ -f "${UQMID_MONITOR_CACHE}" ] && while IFS= read -r monitor_cache_line; do
+		object=$(echo "${monitor_cache_line}" | awk '{print $1}')
+		uqmid_monitor_cache_remove "$object"
+	done < "${UQMID_MONITOR_CACHE}"
+
+	kill "-${1}" "$2" 2>/dev/null
+	exit 0
+}
+
+# The cache line is "<object> <device node> <physdev>". The object may be matched on its own.
+uqmid_monitor_get_line() {
+	local object="$1"
+
+	[ -f "${UQMID_MONITOR_CACHE}" ] || return
+	awk -v object="${object}" '!/^#/ && $1 == object { print }' "${UQMID_MONITOR_CACHE}"
+}
+
+uqmid_monitor_cache_remove() {
+	local object="$1"
+
+	local line device physdev port cfg
+	line=$(uqmid_monitor_get_line "${object}")
+	[ -n "${line}" ] || return
+
+	device=$(echo "${line}" | awk '{print $2}')
+	physdev=$(echo "${line}" | awk '{print $3}')
+	port="${device##*/}"
+
+	cfg=$(uqmid_get_modem_config "${device}" "${port}" "${physdev}")
+	if [ -n "${cfg}" ]; then
+		uqmid_log "info" "interface '${cfg}' set '${device}' state unavailable"
+		proto_set_available "${cfg}" 0
+	fi
+
+	uqmid_log "debug" "delete object '$object' from monitor cache"
+	sed -i "/^${object//\//\\/} /d" "${UQMID_MONITOR_CACHE}"
+}
+
+# $1 is the ubus object, $2 the device node
+uqmid_monitor_cache_add() {
+	local object="$1"
+	local device="$2"
+
+	local status physdev port cfg
+
+	status=$(ubus call "${object}" get 2>/dev/null)
+	physdev=$(jsonfilter -s "${status}" -e '@.device' 2>/dev/null)
+	port="${device##*/}"
+
+	uqmid_log "debug" "add object '$object' to monitor cache (device=${device},physdev=${physdev})"
+
+	# On monitor add event, store event details in cache (if not exists yet)
+	grep -qs "^${object} " "${UQMID_MONITOR_CACHE}" || \
+		echo "${object} ${device} ${physdev}" >> "${UQMID_MONITOR_CACHE}"
+
+	cfg=$(uqmid_get_modem_config "${device}" "${port}" "${physdev}")
+	if [ -n "${cfg}" ]; then
+		uqmid_log "info" "interface '${cfg}' set '${device}' state available"
+		proto_set_available "${cfg}" 1
+	fi
+}
+
+# one line of 'ubus -S subscribe uqmid'
+uqmid_monitor_line() {
+	local line="$1"
+	local object device
+
+	object=$(jsonfilter -s "${line}" -e '@["modem.added"].path' 2>/dev/null)
+	if [ -n "${object}" ]; then
+		device=$(jsonfilter -s "${line}" -e '@["modem.added"].device' 2>/dev/null)
+		uqmid_monitor_cache_add "${object}" "${device}"
+		return
+	fi
+
+	object=$(jsonfilter -s "${line}" -e '@["modem.removed"].path' 2>/dev/null)
+	if [ -n "${object}" ]; then
+		uqmid_monitor_cache_remove "${object}"
+	fi
+}
+
+# modems which already exist when we (re)start
+uqmid_monitor_initial_sync() {
+	local modems object device n i
+
+	# the monitor cache is stale if uqmid was restarted
+	[ -f "${UQMID_MONITOR_CACHE}" ] && while IFS= read -r line; do
+		uqmid_monitor_cache_remove "$(echo "${line}" | awk '{print $1}')"
+	done < "${UQMID_MONITOR_CACHE}"
+	rm -f "${UQMID_MONITOR_CACHE}"
+
+	modems=$(ubus call uqmid list 2>/dev/null) || return
+	json_load "${modems}" 2>/dev/null || return
+	json_select modems 2>/dev/null || return
+	json_get_keys keys
+	for i in ${keys}; do
+		json_select "$i"
+		json_get_var object path
+		json_get_var device device
+		json_select ..
+		[ -n "${object}" ] && uqmid_monitor_cache_add "${object}" "${device}"
+	done
+}
+
+main() {
+	mkdir -p "${UQMID_RUNDIR}"
+	chmod 0755 "${UQMID_RUNDIR}"
+
+	while true; do
+		# Wait for uqmid to be available in ubus
+		if ! uqmid_wait_for_daemon; then
+			uqmid_log "info" "uqmid not yet available"
+			continue
+		fi
+
+		uqmid_monitor_initial_sync
+
+		sh -c "echo \$\$; exec ubus -S subscribe uqmid" | {
+			read -r monitor_pid
+			echo "${monitor_pid}" > "${UQMID_RUNDIR}/monitor.subscribe.pid"
+			trap_with_arg func_trap "$monitor_pid" INT TERM
+			local line
+			while read -r line; do
+				uqmid_log "debug" "Monitor line: ${line}"
+				uqmid_monitor_line "$line"
+			done
+		} &
+		child="$!"
+		trap_with_arg func_trap "$child" INT TERM
+
+		# subscribe does not end when the daemon goes away: watch the object
+		while ubus -t 1 list uqmid >/dev/null 2>&1; do
+			# signals interrupt wait, not sleep
+			sleep 5 &
+			wait $!
+		done
+
+		uqmid_log "info" "uqmid went away"
+		# stop the subscription, the reader ends with it
+		kill "$(cat "${UQMID_RUNDIR}/monitor.subscribe.pid" 2>/dev/null)" 2>/dev/null
+		wait "$child" 2>/dev/null
+	done
+}
+
+main "$@"
