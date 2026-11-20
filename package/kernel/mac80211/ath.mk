@@ -1,6 +1,6 @@
 PKG_DRIVERS += \
 	ath ath5k ath6kl ath6kl-sdio ath6kl-usb ath9k ath9k-common ath9k-htc ath10k ath10k-smallbuffers \
-	ath11k ath11k-ahb ath11k-pci ath12k carl9170 owl-loader ar5523 wil6210 qcom-qmi-helpers
+	ath11k ath11k-ahb ath11k-pci ath12k wcn36xx carl9170 owl-loader ar5523 wil6210 qcom-qmi-helpers
 
 PKG_CONFIG_DEPENDS += \
 	CONFIG_PACKAGE_ATH_DEBUG \
@@ -69,6 +69,7 @@ config-$(call config_package,ath11k) += ATH11K
 config-$(call config_package,ath11k-ahb) += ATH11K_AHB
 config-$(call config_package,ath11k-pci) += ATH11K_PCI
 config-$(call config_package,ath12k) += ATH12K
+config-$(call config_package,wcn36xx) += WCN36XX
 
 config-$(call config_package,ath5k) += ATH5K ATH5K_PCI
 
@@ -135,6 +136,8 @@ define KernelPackage/qcom-qmi-helpers
   $(call KernelPackage/mac80211/Default)
   TITLE:=Qualcomm QMI backports helpers
   HIDDEN:=1
+  # msm89xx builds QCOM_QMI_HELPERS into the kernel (needed by the modem stack)
+  DEPENDS+= @!TARGET_msm89xx
   FILES:=$(PKG_BUILD_DIR)/drivers/soc/qcom/qmi_helpers.ko
   AUTOLOAD:=$(call AutoProbe,qmi_helpers)
 endef
@@ -362,6 +365,20 @@ endef
 define KernelPackage/ath11k-pci/description
 This module adds support for Qualcomm Technologies 802.11ax family of
 chipsets with PCI bus.
+endef
+
+define KernelPackage/wcn36xx
+  $(call KernelPackage/mac80211/Default)
+  TITLE:=Qualcomm WCN36xx (Riva/Pronto) wireless support
+  URL:=https://wireless.wiki.kernel.org/en/users/drivers/wcn36xx
+  DEPENDS+= @TARGET_msm89xx +kmod-ath
+  FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/wcn36xx/wcn36xx.ko
+  AUTOLOAD:=$(call AutoProbe,wcn36xx)
+endef
+
+define KernelPackage/wcn36xx/description
+This module adds support for the WCN3620/WCN3660/WCN3680 wireless cores
+(Riva/Pronto) found in Qualcomm Snapdragon SoCs such as MSM8916.
 endef
 
 define KernelPackage/ath12k

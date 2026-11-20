@@ -1,0 +1,78 @@
+From: akbar-npj <https://github.com/akbar-npj/msm8916-openwrt>
+Subject: [PATCH] wifi: wcn36xx: declare interface combinations
+
+The firmware has two BSS slots on a single channel. Declare AP+AP and
+AP+STA combinations so a second interface can be created.
+
+Source: https://github.com/akbar-npj/msm8916-openwrt (openwrt-overlay/package/kernel/mac80211/patches/ath/452-wcn36xx-iface-combinations.patch)
+---
+--- a/drivers/net/wireless/ath/wcn36xx/main.c
++++ b/drivers/net/wireless/ath/wcn36xx/main.c
+@@ -1440,6 +1440,56 @@ wcn36xx_set_ieee80211_vht_caps(struct ie
+ 	vht_cap->vht_mcs.tx_mcs_map = vht_cap->vht_mcs.rx_mcs_map;
+ }
+ 
++/*
++ * Interface combinations.
++ *
++ * The firmware supports up to 2 BSSIDs, and this is a single radio with a
++ * single operating channel, so every interface shares one channel.
++ * Declaring combinations lets mac80211 accept a second interface:
++ *
++ *   - two APs (multi-SSID), or
++ *   - one AP plus one station (concurrent AP+STA).
++ *
++ * Without any combination mac80211 treats the wiphy as single-interface-only
++ * and rejects a second interface with -EBUSY.
++ *
++ * ADHOC/MESH are deliberately left out: mac80211 rejects any combination that
++ * permits more than one IBSS interface, and listing them makes wiphy
++ * registration fail.
++ */
++static const struct ieee80211_iface_limit wcn36xx_iface_limits_ap[] = {
++	{
++		.max = 2,
++		.types = BIT(NL80211_IFTYPE_AP),
++	},
++};
++
++static const struct ieee80211_iface_limit wcn36xx_iface_limits_ap_sta[] = {
++	{
++		.max = 1,
++		.types = BIT(NL80211_IFTYPE_AP),
++	},
++	{
++		.max = 1,
++		.types = BIT(NL80211_IFTYPE_STATION),
++	},
++};
++
++static const struct ieee80211_iface_combination wcn36xx_iface_combinations[] = {
++	{
++		.num_different_channels = 1,
++		.max_interfaces = 2,
++		.n_limits = ARRAY_SIZE(wcn36xx_iface_limits_ap),
++		.limits = wcn36xx_iface_limits_ap,
++	},
++	{
++		.num_different_channels = 1,
++		.max_interfaces = 2,
++		.n_limits = ARRAY_SIZE(wcn36xx_iface_limits_ap_sta),
++		.limits = wcn36xx_iface_limits_ap_sta,
++	},
++};
++
+ static int wcn36xx_init_ieee80211(struct wcn36xx *wcn)
+ {
+ 	static const u32 cipher_suites[] = {
+@@ -1464,6 +1514,10 @@ static int wcn36xx_init_ieee80211(struct
+ 		BIT(NL80211_IFTYPE_ADHOC) |
+ 		BIT(NL80211_IFTYPE_MESH_POINT);
+ 
++	wcn->hw->wiphy->iface_combinations = wcn36xx_iface_combinations;
++	wcn->hw->wiphy->n_iface_combinations =
++		ARRAY_SIZE(wcn36xx_iface_combinations);
++
+ 	wcn->hw->wiphy->bands[NL80211_BAND_2GHZ] = &wcn_band_2ghz;
+ 	if (wcn->rf_id != RF_IRIS_WCN3620)
+ 		wcn->hw->wiphy->bands[NL80211_BAND_5GHZ] = &wcn_band_5ghz;

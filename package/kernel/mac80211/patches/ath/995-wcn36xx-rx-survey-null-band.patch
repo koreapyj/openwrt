@@ -1,0 +1,20 @@
+From: akbar-npj <https://github.com/akbar-npj/msm8916-openwrt>
+Subject: [PATCH] wifi: wcn36xx: fix NULL deref in the RX survey path
+
+Skip the survey update when the frame's band is not registered (5 GHz on
+WCN3620), which otherwise panics during interface teardown.
+
+Source: https://github.com/akbar-npj/msm8916-openwrt (openwrt-overlay/package/kernel/mac80211/patches/ath/459-wcn36xx-rx-survey-null-band.patch)
+---
+--- a/drivers/net/wireless/ath/wcn36xx/txrx.c
++++ b/drivers/net/wireless/ath/wcn36xx/txrx.c
+@@ -286,6 +286,9 @@ static void wcn36xx_update_survey(struct
+ 		idx = wcn->hw->wiphy->bands[NL80211_BAND_2GHZ]->n_channels;
+ 
+ 	sband = wcn->hw->wiphy->bands[band];
++	if (!sband)
++		return;
++
+ 	channel = sband->channels;
+ 
+ 	for (i = 0; i < sband->n_channels; i++, channel++) {
